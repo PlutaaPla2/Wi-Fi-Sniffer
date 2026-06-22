@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.env
+venv/
+.venv/
+
+# Project output — never commit captured data
+*.csv
+*.pcap
+*.cap
+csv_logs
+pcap_files
+reference
+maichai
+
+# Editor noise
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
