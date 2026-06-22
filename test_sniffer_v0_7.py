@@ -63,7 +63,8 @@ from scapy.all import sniff, Dot11, Dot11Beacon, Dot11ProbeReq, Dot11Elt, RadioT
 # Examples:
 #   OUTPUT_DIR = "/home/pi/wifi_scans"        # absolute path
 #   OUTPUT_DIR = "scans"                       # relative to wherever you run the script
-OUTPUT_DIR = "/home/rootpi/wifi_sniffer_Phumvit/csv_logs"            # ← edit this
+#OUTPUT_DIR = "/home/rootpi/wifi_sniffer_Phumvit/csv_logs"            # ← edit this
+OUTPUT_DIR = "./csv_logs/"
 
 
 # ─── Distance estimation — Log-Distance Path Loss model ──────────────────────
@@ -72,7 +73,7 @@ OUTPUT_DIR = "/home/rootpi/wifi_sniffer_Phumvit/csv_logs"            # ← edit 
 #
 # TX_POWER  : Expected RSSI at exactly 1 metre from the device (in dBm).
 #             -59 dBm is a widely-used default for consumer WiFi devices.
-#             You can calibrate this by measuring a known device at 1 m.
+#             You can calibrate this by measuring a known device at 1 m
 #
 # N (path loss exponent): How much signal degrades with distance.
 #   - Lower N = signal travels further per dB drop (open air)
