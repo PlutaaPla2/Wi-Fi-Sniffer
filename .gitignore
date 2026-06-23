@@ -23,3 +23,14 @@ maichai
 # OS
 .DS_Store
 Thumbs.db
+
+#Secret
+.env.*
+*.key
+*.pem
+*.p12
+*.crt
+secrets/
+config.local.*
+__pycache__/
+*.log
