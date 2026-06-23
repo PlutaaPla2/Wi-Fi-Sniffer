@@ -24,3 +24,31 @@ Detect Wi-Fi probe and client activity to estimate room occupancy for AC control
   - Use multiple sniffers in different room positions and compare RSSI patterns; this is the strongest non-invasive improvement for room occupancy.
   - Calibrate RSSI thresholds with known devices in the actual room before using counts for AC control.
   - Keep conservative lower/upper estimates instead of one exact number, for example "3-5 likely occupants".
+
+## 2026-06-23 Randomized session counter update
+
+- Improved `randomized_session_counter.py` as the first research-based occupancy estimator instead of changing live packet capture.
+- The counter now keeps raw evidence visible by reporting raw unique MACs, ignored access points, real client MACs, randomized client MACs, conservative randomized session groups, and an estimated occupant range.
+- Added a lower/upper estimate strategy:
+  - Lower estimate = real client MACs + conservative randomized session groups.
+  - Upper estimate = real client MACs + all randomized client MACs.
+- Added low-confidence filtering for weak far randomized clients: one-packet far clients with no probe SSIDs are excluded from the lower estimate but still included in the upper bound.
+- Kept the important safety rule that randomized MACs are not merged when their observed session windows overlap.
+- Added/updated tests for:
+  - Strong non-overlapping randomized sessions grouping into one occupant.
+  - Overlapping randomized sessions staying separate.
+  - IE fingerprint alone not being enough to merge devices.
+  - Access points being ignored for occupancy.
+  - Low-confidence far randomized MACs only widening the upper bound.
+- Verification run:
+  - `python3 -m unittest tests/test_randomized_session_counter.py` passed.
+  - `python3 -m py_compile randomized_session_counter.py tests/test_randomized_session_counter.py` passed.
+  - `python3 -m unittest discover` is blocked because `scapy` is not installed in the current environment.
+
+## Important next tasks
+
+- Add full timestamps and RSSI statistics to future CSV exports: `first_seen_full`, `last_seen_full`, `rssi_min`, `rssi_max`, and `rssi_avg`.
+- Capture channel/band per packet if Scapy exposes it reliably, because research shows timing and channel behavior are stronger than IE fingerprint alone.
+- Test the counter with controlled real-room captures: one phone, two similar phones, two same-model phones at the same time, empty room, and nearby hallway traffic.
+- Tune the low-confidence filter and grouping threshold using real captures before using the output for AC control.
+- After the post-processing estimator is trusted, consider adding rolling occupancy output to `wifi_sniffer.py`.
