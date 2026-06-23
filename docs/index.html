@@ -1,0 +1,1242 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Wi-Fi Sniffer v0.7 Explained</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --ink: #18212b;
+      --muted: #596778;
+      --line: #d8dee7;
+      --panel: #f7f9fc;
+      --paper: #ffffff;
+      --accent: #117c8b;
+      --accent-2: #b24a3b;
+      --accent-3: #5a6f2c;
+      --code: #26313d;
+      --code-bg: #eef3f7;
+      --mark: #fff1b8;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    html {
+      scroll-behavior: smooth;
+    }
+
+    body {
+      margin: 0;
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      color: var(--ink);
+      background: #eef2f5;
+      line-height: 1.55;
+    }
+
+    a {
+      color: var(--accent);
+      text-decoration-thickness: 1px;
+      text-underline-offset: 3px;
+    }
+
+    code {
+      padding: 0.1rem 0.28rem;
+      border-radius: 4px;
+      background: var(--code-bg);
+      color: var(--code);
+      font-size: 0.93em;
+    }
+
+    pre {
+      margin: 0;
+      padding: 1rem;
+      overflow-x: auto;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: #18212b;
+      color: #f3f6fb;
+      line-height: 1.45;
+    }
+
+    pre code {
+      padding: 0;
+      border-radius: 0;
+      background: transparent;
+      color: inherit;
+      font-size: 0.9rem;
+    }
+
+    .shell {
+      color: #dbeafe;
+    }
+
+    .page {
+      display: grid;
+      grid-template-columns: 280px minmax(0, 1fr);
+      min-height: 100vh;
+    }
+
+    .side {
+      position: sticky;
+      top: 0;
+      height: 100vh;
+      padding: 1.25rem;
+      overflow-y: auto;
+      border-right: 1px solid var(--line);
+      background: #f8fafc;
+    }
+
+    .brand {
+      display: grid;
+      gap: 0.3rem;
+      margin-bottom: 1.2rem;
+    }
+
+    .brand h1 {
+      margin: 0;
+      font-size: 1.25rem;
+      line-height: 1.2;
+    }
+
+    .brand p {
+      margin: 0;
+      color: var(--muted);
+      font-size: 0.92rem;
+    }
+
+    .nav {
+      display: grid;
+      gap: 0.15rem;
+      margin-top: 1rem;
+    }
+
+    .nav a {
+      display: block;
+      padding: 0.42rem 0.5rem;
+      border-radius: 6px;
+      color: #324052;
+      text-decoration: none;
+      font-size: 0.92rem;
+    }
+
+    .nav a:hover {
+      background: #e7edf4;
+      color: #111827;
+    }
+
+    .content {
+      min-width: 0;
+      background: var(--paper);
+    }
+
+    .hero {
+      display: grid;
+      grid-template-columns: minmax(0, 1.1fr) minmax(280px, 0.9fr);
+      gap: 2rem;
+      align-items: center;
+      min-height: 72vh;
+      padding: 4rem clamp(1rem, 5vw, 5rem) 2.75rem;
+      border-bottom: 1px solid var(--line);
+      background:
+        linear-gradient(135deg, rgba(17, 124, 139, 0.08), rgba(178, 74, 59, 0.06)),
+        #ffffff;
+    }
+
+    .hero h2 {
+      margin: 0 0 1rem;
+      max-width: 11ch;
+      font-size: clamp(2.5rem, 6vw, 5.2rem);
+      line-height: 0.98;
+      letter-spacing: 0;
+    }
+
+    .hero p {
+      max-width: 64ch;
+      margin: 0 0 1.2rem;
+      color: #405064;
+      font-size: 1.08rem;
+    }
+
+    .hero-list {
+      display: grid;
+      gap: 0.55rem;
+      margin: 1.35rem 0 0;
+      padding: 0;
+      list-style: none;
+    }
+
+    .hero-list li {
+      display: grid;
+      grid-template-columns: 1.7rem 1fr;
+      gap: 0.6rem;
+      align-items: start;
+    }
+
+    .dot {
+      display: inline-grid;
+      place-items: center;
+      width: 1.45rem;
+      height: 1.45rem;
+      border-radius: 50%;
+      background: var(--accent);
+      color: white;
+      font-weight: 700;
+      font-size: 0.8rem;
+    }
+
+    .signal-art {
+      display: grid;
+      gap: 1rem;
+      align-content: center;
+      min-height: 420px;
+      padding: 1.4rem;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #f9fbfd;
+    }
+
+    .air-map {
+      position: relative;
+      min-height: 260px;
+      overflow: hidden;
+      border: 1px solid #ccd5df;
+      border-radius: 8px;
+      background:
+        linear-gradient(90deg, rgba(24, 33, 43, 0.04) 1px, transparent 1px),
+        linear-gradient(rgba(24, 33, 43, 0.04) 1px, transparent 1px),
+        #ffffff;
+      background-size: 32px 32px;
+    }
+
+    .ring {
+      position: absolute;
+      border: 2px solid rgba(17, 124, 139, 0.28);
+      border-radius: 50%;
+      transform: translate(-50%, -50%);
+    }
+
+    .r1 { left: 50%; top: 54%; width: 80px; height: 80px; }
+    .r2 { left: 50%; top: 54%; width: 150px; height: 150px; }
+    .r3 { left: 50%; top: 54%; width: 230px; height: 230px; }
+
+    .adapter {
+      position: absolute;
+      left: 50%;
+      top: 54%;
+      transform: translate(-50%, -50%);
+      display: grid;
+      place-items: center;
+      width: 62px;
+      height: 62px;
+      border-radius: 8px;
+      background: #18212b;
+      color: #ffffff;
+      font-weight: 800;
+      font-size: 0.9rem;
+    }
+
+    .node {
+      position: absolute;
+      display: grid;
+      gap: 0.12rem;
+      min-width: 98px;
+      padding: 0.45rem 0.55rem;
+      border: 1px solid #c9d3de;
+      border-radius: 6px;
+      background: #ffffff;
+      box-shadow: 0 8px 24px rgba(24, 33, 43, 0.08);
+      font-size: 0.78rem;
+    }
+
+    .node strong {
+      font-size: 0.82rem;
+    }
+
+    .client-a { left: 6%; top: 16%; border-left: 4px solid var(--accent); }
+    .client-b { right: 5%; top: 22%; border-left: 4px solid var(--accent-2); }
+    .ap-a { left: 16%; bottom: 10%; border-left: 4px solid var(--accent-3); }
+
+    .caption {
+      margin: 0;
+      color: var(--muted);
+      font-size: 0.9rem;
+    }
+
+    section {
+      padding: 3rem clamp(1rem, 5vw, 5rem);
+      border-bottom: 1px solid var(--line);
+    }
+
+    section h2 {
+      margin: 0 0 0.85rem;
+      font-size: clamp(1.65rem, 3vw, 2.5rem);
+      line-height: 1.1;
+      letter-spacing: 0;
+    }
+
+    section h3 {
+      margin: 1.8rem 0 0.55rem;
+      font-size: 1.2rem;
+      line-height: 1.25;
+    }
+
+    section p {
+      max-width: 80ch;
+      margin: 0.6rem 0;
+      color: #334155;
+    }
+
+    .lede {
+      max-width: 88ch;
+      color: #3c4b5e;
+      font-size: 1.04rem;
+    }
+
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 1rem;
+      margin-top: 1.1rem;
+    }
+
+    .three {
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+    }
+
+    .card {
+      padding: 1rem;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--panel);
+    }
+
+    .card h3 {
+      margin-top: 0;
+    }
+
+    .flow {
+      display: grid;
+      gap: 0.75rem;
+      margin: 1rem 0;
+      padding: 0;
+      list-style: none;
+      counter-reset: flow;
+    }
+
+    .flow li {
+      counter-increment: flow;
+      display: grid;
+      grid-template-columns: 2rem minmax(0, 1fr);
+      gap: 0.8rem;
+      align-items: start;
+      padding: 0.8rem;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #ffffff;
+    }
+
+    .flow li::before {
+      content: counter(flow);
+      display: grid;
+      place-items: center;
+      width: 2rem;
+      height: 2rem;
+      border-radius: 50%;
+      background: var(--accent);
+      color: white;
+      font-weight: 800;
+    }
+
+    .flow strong {
+      display: block;
+      margin-bottom: 0.25rem;
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      margin-top: 1rem;
+      font-size: 0.95rem;
+    }
+
+    th,
+    td {
+      padding: 0.7rem;
+      border: 1px solid var(--line);
+      text-align: left;
+      vertical-align: top;
+    }
+
+    th {
+      background: #eef3f7;
+      color: #243244;
+    }
+
+    .example {
+      margin-top: 1rem;
+      padding: 1rem;
+      border-left: 4px solid var(--accent);
+      background: #f0f8fa;
+    }
+
+    .warning {
+      border-left-color: var(--accent-2);
+      background: #fff4f1;
+    }
+
+    .formula {
+      display: inline-block;
+      margin: 0.5rem 0;
+      padding: 0.55rem 0.75rem;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: #ffffff;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      color: #243244;
+    }
+
+    .mini-diagram {
+      display: grid;
+      grid-template-columns: repeat(5, minmax(90px, 1fr));
+      gap: 0.45rem;
+      margin: 1rem 0;
+      overflow-x: auto;
+    }
+
+    .box {
+      padding: 0.65rem;
+      border: 1px solid #b9c4d0;
+      border-radius: 6px;
+      background: #ffffff;
+      text-align: center;
+      font-size: 0.9rem;
+    }
+
+    .box strong {
+      display: block;
+      color: #15202b;
+    }
+
+    .tag-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.45rem;
+      margin: 0.7rem 0;
+    }
+
+    .tag {
+      padding: 0.28rem 0.48rem;
+      border: 1px solid #c8d3df;
+      border-radius: 999px;
+      background: #ffffff;
+      color: #324052;
+      font-size: 0.86rem;
+    }
+
+    .footer {
+      padding-bottom: 5rem;
+    }
+
+    @media (max-width: 980px) {
+      .page {
+        grid-template-columns: 1fr;
+      }
+
+      .side {
+        position: static;
+        height: auto;
+        border-right: 0;
+        border-bottom: 1px solid var(--line);
+      }
+
+      .nav {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+      }
+
+      .hero {
+        grid-template-columns: 1fr;
+        min-height: auto;
+      }
+
+      .grid,
+      .three {
+        grid-template-columns: 1fr;
+      }
+    }
+
+    @media (max-width: 560px) {
+      .nav {
+        grid-template-columns: 1fr;
+      }
+
+      .hero,
+      section {
+        padding-left: 1rem;
+        padding-right: 1rem;
+      }
+
+      .signal-art {
+        min-height: 360px;
+      }
+
+      .air-map {
+        min-height: 300px;
+      }
+
+      .node {
+        min-width: 84px;
+        font-size: 0.72rem;
+      }
+
+      table {
+        display: block;
+        overflow-x: auto;
+      }
+    }
+  </style>
+</head>
+<body>
+  <div class="page">
+    <aside class="side">
+      <div class="brand">
+        <h1>Wi-Fi Sniffer v0.7</h1>
+        <p>A readable walkthrough of <code>test_sniffer_v0_7.py</code>.</p>
+      </div>
+      <nav class="nav" aria-label="Page sections">
+        <a href="#overview">Overview</a>
+        <a href="#how-to-run">How To Run</a>
+        <a href="#big-picture">Big Picture Flow</a>
+        <a href="#wifi-basics">Wi-Fi Basics</a>
+        <a href="#data-model">Data Model</a>
+        <a href="#distance">Distance</a>
+        <a href="#mac">MAC Analysis</a>
+        <a href="#fingerprint">IE Fingerprint</a>
+        <a href="#packet-handler">Packet Handler</a>
+        <a href="#output">Output</a>
+        <a href="#recovery">Recovery</a>
+        <a href="#function-map">Function Map</a>
+        <a href="#examples">Examples</a>
+        <a href="#limits">Limits</a>
+      </nav>
+    </aside>
+
+    <main class="content">
+      <header class="hero">
+        <div>
+          <h2>Passive Wi-Fi Sniffer Explained</h2>
+          <p>
+            This page explains how the Python script listens for Wi-Fi management
+            frames, remembers each device by MAC address, estimates rough
+            distance from signal strength, detects randomized MAC addresses,
+            fingerprints packet Information Elements, prints a summary, and
+            exports a CSV file.
+          </p>
+          <ul class="hero-list">
+            <li><span class="dot">1</span><span>The script does not connect to networks. It listens passively in monitor mode.</span></li>
+            <li><span class="dot">2</span><span>Each unique source MAC becomes one entry in <code>seen_devices</code>.</span></li>
+            <li><span class="dot">3</span><span>The output is designed for occupancy estimation and debugging false counts.</span></li>
+          </ul>
+        </div>
+        <div class="signal-art" aria-label="Diagram of passive Wi-Fi capture">
+          <div class="air-map">
+            <span class="ring r1"></span>
+            <span class="ring r2"></span>
+            <span class="ring r3"></span>
+            <div class="adapter">MON</div>
+            <div class="node client-a"><strong>Phone</strong><span>Probe Request</span><span>-52 dBm</span></div>
+            <div class="node client-b"><strong>Laptop</strong><span>Probe Request</span><span>-71 dBm</span></div>
+            <div class="node ap-a"><strong>Router</strong><span>Beacon</span><span>SSID visible</span></div>
+          </div>
+          <p class="caption">
+            The monitor-mode adapter receives frames already present in the air.
+            The script reads metadata from those frames; it does not decrypt traffic.
+          </p>
+        </div>
+      </header>
+
+      <section id="overview">
+        <h2>Overview</h2>
+        <p class="lede">
+          <code>test_sniffer_v0_7.py</code> is a single-file Scapy program for
+          passive Wi-Fi observation. It focuses on 802.11 management frames:
+          Probe Requests from client devices and Beacons from access points are
+          the most useful for this project.
+        </p>
+        <div class="grid three">
+          <article class="card">
+            <h3>What It Detects</h3>
+            <p>
+              It detects source MAC addresses, frame types, signal strength,
+              probe SSIDs, access point SSIDs, randomized MAC status, vendor
+              names for real MACs, and Information Element fingerprints.
+            </p>
+          </article>
+          <article class="card">
+            <h3>What It Stores</h3>
+            <p>
+              It stores one record per MAC address in the global
+              <code>seen_devices</code> dictionary. Each record accumulates
+              packet count, first and last seen time, SSIDs, frame types, and
+              signal-derived distance.
+            </p>
+          </article>
+          <article class="card">
+            <h3>What It Produces</h3>
+            <p>
+              It prints live updates for interesting events, prints a final
+              summary when the capture ends, optionally saves a PCAP, and always
+              exports a timestamped CSV into <code>./csv_logs/</code>.
+            </p>
+          </article>
+        </div>
+      </section>
+
+      <section id="how-to-run">
+        <h2>How To Run</h2>
+        <p>
+          The script expects Linux, a compatible wireless adapter, monitor mode,
+          and root permission. The setup comments at the top of the Python file
+          show the intended commands.
+        </p>
+        <pre><code class="shell">sudo ip link set wlan0 down
+sudo iw dev wlan0 set type monitor
+sudo ip link set wlan0 up
+sudo python3 test_sniffer_v0_7.py --iface wlan0</code></pre>
+        <h3>Important Options</h3>
+        <table>
+          <thead>
+            <tr>
+              <th>Option</th>
+              <th>Meaning</th>
+              <th>Example</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><code>--iface</code> or <code>-i</code></td>
+              <td>Wireless interface already in monitor mode.</td>
+              <td><code>--iface wlan1</code></td>
+            </tr>
+            <tr>
+              <td><code>--count</code> or <code>-c</code></td>
+              <td>Number of packets to capture. <code>0</code> means unlimited.</td>
+              <td><code>--count 500</code></td>
+            </tr>
+            <tr>
+              <td><code>--hop</code> or <code>-H</code></td>
+              <td>Starts a background channel hopper for channels 1 through 13.</td>
+              <td><code>--hop</code></td>
+            </tr>
+            <tr>
+              <td><code>--save</code> or <code>-s</code></td>
+              <td>Also saves captured packets to a PCAP file.</td>
+              <td><code>--save capture.pcap</code></td>
+            </tr>
+            <tr>
+              <td><code>--env</code></td>
+              <td>Chooses the distance model preset: <code>open</code>, <code>office</code>, or <code>indoor</code>.</td>
+              <td><code>--env office</code></td>
+            </tr>
+          </tbody>
+        </table>
+        <div class="example warning">
+          <strong>Privacy note:</strong> Probe SSIDs can reveal networks a device
+          has known before. Avoid publishing real captured MAC addresses or SSID
+          names in screenshots, CSV examples, or GitHub issues.
+        </div>
+      </section>
+
+      <section id="big-picture">
+        <h2>Big Picture Flow</h2>
+        <p>
+          The program is easiest to understand as a pipeline. Packets enter from
+          Scapy's <code>sniff()</code>, then <code>handle_packet()</code> decides
+          whether the packet is useful and updates the global device table.
+        </p>
+        <ol class="flow">
+          <li>
+            <div>
+              <strong>Start command-line setup</strong>
+              <span><code>main()</code> reads arguments, sets the distance environment, optionally starts channel hopping, and initializes timing.</span>
+            </div>
+          </li>
+          <li>
+            <div>
+              <strong>Start Scapy capture</strong>
+              <span><code>sniff()</code> listens on the monitor-mode interface and calls a small nested <code>handler()</code> for each packet.</span>
+            </div>
+          </li>
+          <li>
+            <div>
+              <strong>Filter packet type</strong>
+              <span><code>handle_packet()</code> ignores anything that is not an 802.11 management frame.</span>
+            </div>
+          </li>
+          <li>
+            <div>
+              <strong>Extract useful fields</strong>
+              <span>The script reads source MAC, RSSI, frame subtype, probe SSID, beacon SSID, and Information Elements.</span>
+            </div>
+          </li>
+          <li>
+            <div>
+              <strong>Update one device record</strong>
+              <span>The source MAC is the dictionary key. New MACs create a record; existing MACs update last seen time, packet count, RSSI, SSIDs, and fingerprint data.</span>
+            </div>
+          </li>
+          <li>
+            <div>
+              <strong>Finish and export</strong>
+              <span>When the capture stops, <code>print_summary()</code> prints the report and <code>export_csv()</code> writes a timestamped CSV.</span>
+            </div>
+          </li>
+        </ol>
+      </section>
+
+      <section id="wifi-basics">
+        <h2>Wi-Fi Basics</h2>
+        <p>
+          Wi-Fi frames have a type and subtype. This script only keeps
+          management frames, because those are useful for discovering nearby
+          clients and access points without joining any network.
+        </p>
+        <div class="grid">
+          <article class="card">
+            <h3>Probe Request</h3>
+            <p>
+              A client device sends Probe Requests while scanning. Sometimes the
+              SSID field is empty, meaning the device is asking for any nearby
+              network. Sometimes it contains a known network name.
+            </p>
+            <div class="example">
+              Example: a phone sends a Probe Request for <code>Cafe_WiFi</code>.
+              The script adds <code>Cafe_WiFi</code> to that MAC's
+              <code>probe_ssids</code> set.
+            </div>
+          </article>
+          <article class="card">
+            <h3>Beacon</h3>
+            <p>
+              An access point sends Beacons repeatedly to announce that a Wi-Fi
+              network exists. Beacon frames usually contain the AP's SSID.
+            </p>
+            <div class="example">
+              Example: a router sends a Beacon with SSID <code>Office_AP</code>.
+              The script classifies that MAC as an access point because
+              <code>beacon_ssid</code> is present.
+            </div>
+          </article>
+        </div>
+        <h3>Frame Type Table Used By The Script</h3>
+        <p>
+          <code>FRAME_TYPES</code> maps management-frame subtype numbers to
+          readable labels. Subtype <code>4</code> is Probe Request and subtype
+          <code>8</code> is Beacon.
+        </p>
+      </section>
+
+      <section id="data-model">
+        <h2>Data Model</h2>
+        <p>
+          The central structure is <code>seen_devices</code>. It is a dictionary
+          keyed by source MAC address. This avoids double-counting the same MAC
+          inside one capture session.
+        </p>
+        <pre><code>seen_devices = {
+  "aa:bb:cc:dd:ee:ff": {
+    "first_seen": "14:32:10",
+    "last_seen": "14:33:05",
+    "rssi": -61,
+    "distance_m": 1.2,
+    "zone": "immediate  (&lt;2 m)",
+    "randomized": False,
+    "vendor": "Apple, Inc.",
+    "ie_fingerprint": "8a4d91c2",
+    "frame_types": {"Probe Request"},
+    "probe_ssids": {"Office_WiFi"},
+    "packet_count": 7
+  }
+}</code></pre>
+        <h3>Why Sets Are Used</h3>
+        <p>
+          Fields such as <code>frame_types</code>, <code>probe_ssids</code>, and
+          <code>vendor_ies</code> are sets. A set automatically removes
+          duplicates, so the same SSID or frame type does not appear many times
+          in the final report.
+        </p>
+        <div class="example">
+          If a phone probes for <code>HomeWiFi</code> ten times, the set still
+          stores it once: <code>{"HomeWiFi"}</code>. The packet count still
+          increases, so you know how active the device was.
+        </div>
+      </section>
+
+      <section id="distance">
+        <h2>Distance Estimation</h2>
+        <p>
+          <code>estimate_distance()</code> converts RSSI into a rough distance.
+          RSSI is signal strength in dBm. Values are usually negative:
+          <code>-40 dBm</code> is strong, <code>-80 dBm</code> is weak.
+        </p>
+        <p class="formula">distance = 10 ^ ((TX_POWER_DBM - rssi) / (10 * N))</p>
+        <table>
+          <thead>
+            <tr>
+              <th>Name</th>
+              <th>Meaning</th>
+              <th>In This Script</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><code>TX_POWER_DBM</code></td>
+              <td>Expected RSSI at 1 meter.</td>
+              <td><code>-59</code></td>
+            </tr>
+            <tr>
+              <td><code>rssi</code></td>
+              <td>Measured signal from the current packet.</td>
+              <td>Example: <code>-65</code></td>
+            </tr>
+            <tr>
+              <td><code>N</code></td>
+              <td>Path loss exponent. Higher means signal drops faster.</td>
+              <td><code>2.0</code> open, <code>2.7</code> office, <code>3.5</code> indoor</td>
+            </tr>
+          </tbody>
+        </table>
+        <h3>Worked Example</h3>
+        <p>
+          Suppose the script sees <code>-65 dBm</code> in the default
+          <code>office</code> environment. Office uses <code>N = 2.7</code>.
+        </p>
+        <pre><code>exponent = (-59 - -65) / (10 * 2.7)
+         = 6 / 27
+         = 0.222
+
+distance = 10 ** 0.222
+         = 1.7 metres approximately</code></pre>
+        <p>
+          The script then assigns a zone. Up to 2 meters is
+          <code>immediate</code>, up to 7 meters is <code>near</code>, up to 20
+          meters is <code>mid</code>, and above that is <code>far</code>.
+        </p>
+        <div class="example warning">
+          RSSI distance is only an estimate. Walls, adapter orientation, antenna
+          quality, human bodies, and multipath reflection can move the estimate
+          by several meters. Use it for proximity, not exact location.
+        </div>
+      </section>
+
+      <section id="mac">
+        <h2>MAC Analysis</h2>
+        <p>
+          A MAC address has 6 bytes. The script checks the second-lowest bit of
+          the first byte. That bit is called the Locally Administered bit, often
+          shortened to LA bit.
+        </p>
+        <div class="mini-diagram" aria-label="MAC address byte diagram">
+          <div class="box"><strong>Byte 1</strong><span>02</span></div>
+          <div class="box"><strong>Byte 2</strong><span>11</span></div>
+          <div class="box"><strong>Byte 3</strong><span>22</span></div>
+          <div class="box"><strong>Byte 4-6</strong><span>33:44:55</span></div>
+          <div class="box"><strong>LA Bit</strong><span>set</span></div>
+        </div>
+        <h3>Randomized MAC</h3>
+        <p>
+          <code>is_locally_administered()</code> returns <code>True</code> when
+          the LA bit is set. That usually means the operating system generated a
+          temporary randomized MAC address.
+        </p>
+        <pre><code>mac = "02:11:22:33:44:55"
+first_byte = int("02", 16)     # decimal 2
+first_byte &amp; 0b00000010        # non-zero, so randomized</code></pre>
+        <h3>Real Manufacturer MAC</h3>
+        <p>
+          If the LA bit is not set, the first three bytes are an OUI. The script
+          checks <code>KNOWN_OUIS</code> first, then Scapy's
+          <code>conf.manufdb</code>. This is done by <code>lookup_vendor()</code>.
+        </p>
+        <div class="example">
+          Example: <code>00:17:f2:12:34:56</code> starts with
+          <code>00:17:f2</code>. The curated table maps that OUI to Apple.
+        </div>
+        <div class="example warning">
+          Vendor lookup is intentionally skipped for randomized MACs. A
+          randomized MAC's first three bytes are not reliable manufacturer data.
+        </div>
+      </section>
+
+      <section id="fingerprint">
+        <h2>IE Fingerprint</h2>
+        <p>
+          Information Elements, or IEs, are small tagged fields inside Probe
+          Requests and Beacons. Their IDs and order are often influenced by the
+          device's chipset, OS, and driver. The script uses that sequence as a
+          fingerprint.
+        </p>
+        <div class="mini-diagram" aria-label="Information Element TLV diagram">
+          <div class="box"><strong>ID</strong><span>0</span></div>
+          <div class="box"><strong>Length</strong><span>4</span></div>
+          <div class="box"><strong>Data</strong><span>SSID</span></div>
+          <div class="box"><strong>ID</strong><span>1</span></div>
+          <div class="box"><strong>Length + Data</strong><span>Rates</span></div>
+        </div>
+        <h3>Why The Script Reads Raw Bytes</h3>
+        <p>
+          Scapy normally exposes IEs as chained <code>Dot11Elt</code> layers.
+          But unusual, newer, vendor-specific, or truncated IEs can cause Scapy
+          to stop building clean layers. To avoid losing data, the function
+          <code>get_ie_fingerprint()</code> reads raw bytes from the first
+          <code>Dot11Elt</code> and manually walks the TLV format.
+        </p>
+        <pre><code>while i + 1 &lt; len(raw_bytes):
+    ie_id = raw_bytes[i]
+    ie_len = raw_bytes[i + 1]
+    data_start = i + 2
+    data_end = data_start + ie_len
+    ie_ids.append(ie_id)
+    i = data_end</code></pre>
+        <h3>Readable Names And Hash</h3>
+        <p>
+          <code>IE_NAMES</code> maps common IE IDs to readable names. The raw ID
+          list is also converted to an MD5 hash and shortened to 8 characters.
+          The short hash is easier to scan in terminal output and CSV files.
+        </p>
+        <div class="example">
+          Example IE IDs: <code>[0, 1, 50, 45, 127, 221]</code><br>
+          Readable sequence:
+          <code>SSID-Rates-ExtRates-HT-Cap-ExtCap-Vendor</code><br>
+          Fingerprint: a short value such as <code>3f91a8c0</code>.
+        </div>
+        <p>
+          For vendor-specific IEs, ID <code>221</code>, the script also extracts
+          the first three bytes of the IE data. Those bytes are vendor OUIs for
+          the specific extension inside the frame.
+        </p>
+      </section>
+
+      <section id="packet-handler">
+        <h2>Packet Handler</h2>
+        <p>
+          <code>handle_packet(pkt)</code> is the core of the program. Every
+          captured packet passes through it.
+        </p>
+        <ol class="flow">
+          <li>
+            <div>
+              <strong>Keep only 802.11 management frames</strong>
+              <span>The handler returns early unless the packet has a <code>Dot11</code> layer and <code>pkt[Dot11].type == 0</code>.</span>
+            </div>
+          </li>
+          <li>
+            <div>
+              <strong>Read source MAC</strong>
+              <span><code>pkt[Dot11].addr2</code> is treated as the device that sent the frame. Empty source addresses are ignored.</span>
+            </div>
+          </li>
+          <li>
+            <div>
+              <strong>Read RSSI</strong>
+              <span>If a <code>RadioTap</code> layer exists, the script reads <code>dBm_AntSignal</code>. Some adapters may not provide it.</span>
+            </div>
+          </li>
+          <li>
+            <div>
+              <strong>Extract SSID details</strong>
+              <span>Subtype <code>4</code> tries to read a Probe Request SSID. Subtype <code>8</code> walks Beacon IEs to find the AP SSID.</span>
+            </div>
+          </li>
+          <li>
+            <div>
+              <strong>Create or update record</strong>
+              <span>New MACs get a full record. Existing MACs update <code>last_seen</code>, RSSI, packet count, sets, and fingerprint fields.</span>
+            </div>
+          </li>
+          <li>
+            <div>
+              <strong>Print useful live output</strong>
+              <span><code>print_device_update()</code> prints when a device is first seen or when a Probe/Beacon SSID adds new useful information.</span>
+            </div>
+          </li>
+        </ol>
+        <h3>Why This Avoids Some Double Counting</h3>
+        <p>
+          A device that sends 100 packets with the same MAC is still one entry,
+          because the MAC is the dictionary key. The packet count increases, but
+          the unique-device count does not.
+        </p>
+        <div class="example warning">
+          If the same physical phone changes randomized MAC addresses during a
+          scan, this script may count it as multiple MACs. The IE fingerprint can
+          help identify that possibility, but the current unique-device count is
+          still MAC-based.
+        </div>
+      </section>
+
+      <section id="output">
+        <h2>Output</h2>
+        <p>
+          There are three output paths: live terminal updates, final terminal
+          summary, and CSV export.
+        </p>
+        <div class="grid">
+          <article class="card">
+            <h3>Live Update</h3>
+            <p>
+              First sighting prints MAC, frame type, signal, distance, MAC type,
+              vendor when available, IE fingerprint, and first seen time.
+            </p>
+          </article>
+          <article class="card">
+            <h3>Summary</h3>
+            <p>
+              <code>print_summary()</code> separates access points from client
+              devices. APs have <code>beacon_ssid</code>; clients do not.
+            </p>
+          </article>
+        </div>
+        <h3>CSV Columns</h3>
+        <p>
+          <code>CSV_FIELDS</code> defines the exact CSV order. The CSV repeats
+          scan start, stop, and duration on every row so each row stays useful
+          even when filtered or copied elsewhere.
+        </p>
+        <table>
+          <thead>
+            <tr>
+              <th>Column Group</th>
+              <th>Fields</th>
+              <th>Purpose</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Scan timing</td>
+              <td><code>scan_start</code>, <code>scan_stop</code>, <code>scan_duration</code></td>
+              <td>Shows when the capture happened.</td>
+            </tr>
+            <tr>
+              <td>Identity</td>
+              <td><code>mac</code>, <code>type</code>, <code>ssid</code>, <code>probe_ssids</code></td>
+              <td>Describes the device or access point.</td>
+            </tr>
+            <tr>
+              <td>Signal</td>
+              <td><code>rssi_dbm</code>, <code>distance_m</code>, <code>zone</code></td>
+              <td>Supports proximity and occupancy decisions.</td>
+            </tr>
+            <tr>
+              <td>Analysis</td>
+              <td><code>mac_randomized</code>, <code>vendor</code>, <code>ie_fingerprint</code>, <code>ie_sequence</code>, <code>vendor_ies</code></td>
+              <td>Helps explain why a device was counted and whether the MAC is trustworthy.</td>
+            </tr>
+            <tr>
+              <td>Activity</td>
+              <td><code>packet_count</code>, <code>frame_types</code>, <code>first_seen</code>, <code>last_seen</code></td>
+              <td>Shows how active the device was during the scan.</td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+
+      <section id="recovery">
+        <h2>Channel Hopping And Recovery</h2>
+        <h3>Channel Hopping</h3>
+        <p>
+          Wi-Fi devices transmit on different channels. If your adapter stays on
+          one channel, it only sees traffic on that channel. With
+          <code>--hop</code>, <code>start_channel_hopper()</code> runs in a
+          daemon thread and repeatedly calls <code>iwconfig &lt;iface&gt; channel
+          &lt;ch&gt;</code> for channels 1 through 13.
+        </p>
+        <div class="example warning">
+          Hopping can see more devices, but it can also miss packets because the
+          adapter is not listening to every channel at every moment.
+        </div>
+        <h3>Adapter Drop Recovery</h3>
+        <p>
+          Some USB adapters drop out of monitor mode. Scapy may return from
+          <code>sniff()</code> without raising a normal exception. The script
+          handles this by wrapping <code>sniff()</code> in a retry loop.
+        </p>
+        <pre><code>ip link set &lt;iface&gt; down
+iw dev &lt;iface&gt; set type monitor
+ip link set &lt;iface&gt; up</code></pre>
+        <p>
+          <code>MAX_RETRIES</code> is <code>10</code> and
+          <code>RETRY_DELAY</code> is <code>3</code> seconds. Already discovered
+          devices stay in <code>seen_devices</code> across retries.
+        </p>
+      </section>
+
+      <section id="function-map">
+        <h2>Function Map</h2>
+        <table>
+          <thead>
+            <tr>
+              <th>Function or Constant</th>
+              <th>Role</th>
+              <th>Example Question It Answers</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><code>OUTPUT_DIR</code></td>
+              <td>Folder where CSV files are saved.</td>
+              <td>Where did the result file go?</td>
+            </tr>
+            <tr>
+              <td><code>ENVIRONMENTS</code></td>
+              <td>Maps distance presets to path loss exponents.</td>
+              <td>Should this scan behave like open air or indoor walls?</td>
+            </tr>
+            <tr>
+              <td><code>estimate_distance()</code></td>
+              <td>Converts RSSI to distance and zone.</td>
+              <td>Is this device close enough to count as inside the room?</td>
+            </tr>
+            <tr>
+              <td><code>is_locally_administered()</code></td>
+              <td>Checks the LA bit in the first MAC byte.</td>
+              <td>Is this MAC probably randomized?</td>
+            </tr>
+            <tr>
+              <td><code>lookup_vendor()</code></td>
+              <td>Finds manufacturer for non-randomized MACs.</td>
+              <td>Who owns this real OUI?</td>
+            </tr>
+            <tr>
+              <td><code>get_ie_fingerprint()</code></td>
+              <td>Builds a compact hash from IE IDs and extracts vendor IE OUIs.</td>
+              <td>Do these randomized MACs look like the same device family?</td>
+            </tr>
+            <tr>
+              <td><code>handle_packet()</code></td>
+              <td>Filters, extracts, updates, and prints per packet.</td>
+              <td>What happens when a new frame arrives?</td>
+            </tr>
+            <tr>
+              <td><code>print_device_update()</code></td>
+              <td>Prints first sightings and newly learned SSIDs.</td>
+              <td>Why did the terminal show this device?</td>
+            </tr>
+            <tr>
+              <td><code>print_summary()</code></td>
+              <td>Prints final AP and client tables.</td>
+              <td>How many unique MACs were discovered?</td>
+            </tr>
+            <tr>
+              <td><code>export_csv()</code></td>
+              <td>Writes one CSV row per device record.</td>
+              <td>How is the report saved for later analysis?</td>
+            </tr>
+            <tr>
+              <td><code>start_channel_hopper()</code></td>
+              <td>Cycles the adapter through 2.4 GHz channels.</td>
+              <td>How can one adapter see more channels?</td>
+            </tr>
+            <tr>
+              <td><code>reset_monitor_mode()</code></td>
+              <td>Attempts to recover monitor mode after adapter failure.</td>
+              <td>What happens if the capture socket closes?</td>
+            </tr>
+            <tr>
+              <td><code>main()</code></td>
+              <td>Parses CLI args, starts sniffing, handles retries, exports results.</td>
+              <td>What controls the whole program?</td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+
+      <section id="examples">
+        <h2>Examples</h2>
+        <h3>Example 1: New Client Device</h3>
+        <pre><code>Incoming frame:
+  subtype: 4
+  frame: Probe Request
+  source MAC: 02:11:22:33:44:55
+  RSSI: -65 dBm
+  SSID element: Cafe_WiFi
+
+Script result:
+  creates seen_devices["02:11:22:33:44:55"]
+  randomized = True
+  vendor = None
+  probe_ssids = {"Cafe_WiFi"}
+  distance_m about 1.7 in office mode
+  type in CSV = Client Device</code></pre>
+        <h3>Example 2: Access Point Beacon</h3>
+        <pre><code>Incoming frame:
+  subtype: 8
+  frame: Beacon
+  source MAC: 50:c7:bf:aa:bb:cc
+  RSSI: -48 dBm
+  Beacon SSID: Room_AP
+
+Script result:
+  creates seen_devices["50:c7:bf:aa:bb:cc"]
+  randomized = False
+  vendor = TP-Link
+  beacon_ssid = "Room_AP"
+  type in CSV = Access Point</code></pre>
+        <h3>Example 3: Same MAC Seen Again</h3>
+        <pre><code>Earlier:
+  aa:bb:cc:dd:ee:ff packet_count = 1
+
+New packet from same MAC:
+  packet_count becomes 2
+  last_seen updates
+  latest RSSI replaces old RSSI
+  new probe SSID is added only if present</code></pre>
+        <h3>Example 4: Possible Randomized-MAC Duplicate</h3>
+        <pre><code>MAC A:
+  02:11:22:33:44:55
+  IE fingerprint: 8d31a2bf
+
+MAC B:
+  06:aa:bb:cc:dd:ee
+  IE fingerprint: 8d31a2bf
+
+Interpretation:
+  They may be the same physical device using different randomized MACs,
+  or they may be two similar devices with the same chipset/OS pattern.
+  The script records the clue, but it does not merge them automatically.</code></pre>
+      </section>
+
+      <section id="limits" class="footer">
+        <h2>Limits And Good Next Steps</h2>
+        <div class="grid">
+          <article class="card">
+            <h3>Limits</h3>
+            <p>
+              Unique counting is MAC-based, so randomized MAC rotation can
+              inflate counts. RSSI distance is approximate. Channel hopping can
+              miss packets. Vendor lookup only works for real OUIs.
+            </p>
+          </article>
+          <article class="card">
+            <h3>Good Next Steps</h3>
+            <p>
+              For room occupancy, compare packet count, recent activity,
+              distance zone, and repeated IE fingerprints. Keep logs that explain
+              why a MAC was counted or ignored so false counts can be debugged.
+            </p>
+          </article>
+        </div>
+        <h3>How To Read The Python File After This Page</h3>
+        <p>
+          Read the file in this order: constants and helper functions first,
+          then <code>handle_packet()</code>, then <code>print_summary()</code>
+          and <code>export_csv()</code>, and finally <code>main()</code>. That
+          order follows the data flow from one packet to the final CSV.
+        </p>
+      </section>
+    </main>
+  </div>
+</body>
+</html>
