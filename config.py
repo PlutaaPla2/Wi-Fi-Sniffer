@@ -87,7 +87,7 @@ KNOWN_OUIS: dict[str, str] = {
     "00:00:f0": "Samsung Electronics",
     "00:e0:fc": "Huawei Technologies",
     "ac:f7:f3": "Xiaomi Communications",
-    "f8:a4:5f": "Oppo Mobile",                  # Xiaomi
+    #"f8:a4:5f": "Oppo Mobile",                  # Xiaomi
     # "d4:f5:13": "Vivo Mobile,                 # Texas Instruments
     "00:1a:11": "Google (Pixel/Nest)",
     "00:16:ea": "Intel Corp (Laptop)",
