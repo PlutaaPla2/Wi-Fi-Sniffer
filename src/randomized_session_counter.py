@@ -20,6 +20,7 @@ from config import CSV_FIELDS
 
 GROUP_SCORE_THRESHOLD = 6
 OVERLAP_TOLERANCE_SECONDS = 5
+LOW_CONFIDENCE_MAX_PACKETS = 1
 
 
 @dataclass(frozen=True)
@@ -116,6 +117,17 @@ def load_observations(csv_path: Path) -> list[Observation]:
 
 def is_client(obs: Observation) -> bool:
     return obs.device_type.lower() != "access point"
+
+
+def is_low_confidence_randomized_noise(obs: Observation) -> bool:
+    """Treat weak one-off far randomized clients as occupancy noise."""
+    if not (is_client(obs) and obs.randomized):
+        return False
+    if obs.packet_count > LOW_CONFIDENCE_MAX_PACKETS:
+        return False
+    if obs.probe_ssids:
+        return False
+    return obs.zone.lower().startswith("far")
 
 
 def sessions_overlap(left: Observation, right: Observation) -> bool:
@@ -259,24 +271,53 @@ def group_randomized_clients(observations: list[Observation]) -> list[SessionGro
 
 
 def estimate_occupancy(observations: list[Observation]) -> dict[str, object]:
+    access_points = [obs for obs in observations if not is_client(obs)]
     real_clients = [
         obs for obs in observations
         if is_client(obs) and not obs.randomized
     ]
-    randomized_groups = group_randomized_clients(observations)
+    randomized_clients = [
+        obs for obs in observations
+        if is_client(obs) and obs.randomized
+    ]
+    low_confidence_randomized = [
+        obs for obs in randomized_clients
+        if is_low_confidence_randomized_noise(obs)
+    ]
+    grouping_candidates = [
+        obs for obs in randomized_clients
+        if not is_low_confidence_randomized_noise(obs)
+    ]
+    randomized_groups = group_randomized_clients(grouping_candidates)
+
+    lower_estimate = len(real_clients) + len(randomized_groups)
+    upper_estimate = len(real_clients) + len(randomized_clients)
 
     return {
+        "raw_unique_macs": len({obs.mac for obs in observations}),
+        "access_point_count": len(access_points),
         "real_client_count": len(real_clients),
+        "randomized_raw_count": len(randomized_clients),
+        "low_confidence_randomized_count": len(low_confidence_randomized),
         "randomized_session_count": len(randomized_groups),
-        "estimated_occupants": len(real_clients) + len(randomized_groups),
+        "estimated_occupants": lower_estimate,
+        "estimated_occupant_range": (lower_estimate, upper_estimate),
         "randomized_groups": randomized_groups,
+        "low_confidence_randomized": low_confidence_randomized,
     }
 
 
 def print_report(result: dict[str, object], show_details: bool) -> None:
+    lower, upper = result["estimated_occupant_range"]
+    range_text = str(lower) if lower == upper else f"{lower}-{upper}"
+
+    print(f"Raw unique MACs        : {result['raw_unique_macs']}")
+    print(f"Access points ignored  : {result['access_point_count']}")
     print(f"Real client MACs       : {result['real_client_count']}")
+    print(f"Randomized client MACs : {result['randomized_raw_count']}")
+    print(f"Low-confidence ignored : {result['low_confidence_randomized_count']}")
     print(f"Randomized sessions    : {result['randomized_session_count']}")
-    print(f"Estimated occupants    : {result['estimated_occupants']}")
+    print(f"Estimated occupants    : {range_text}")
     print(
         "\nMethod: real client MACs count directly; randomized MACs are grouped only "
         "when sessions do not overlap and several signals agree."
@@ -284,6 +325,10 @@ def print_report(result: dict[str, object], show_details: bool) -> None:
     print(
         "Signals used: IE fingerprint, vendor IE OUIs, RSSI/zone similarity, "
         "frame types, probe SSIDs, and time gap."
+    )
+    print(
+        "Weak one-packet far randomized clients with no probe SSIDs are excluded "
+        "from the lower estimate but still included in the upper bound."
     )
     print("Note: this estimates device occupancy; it does not identify a person.")
 
@@ -294,6 +339,11 @@ def print_report(result: dict[str, object], show_details: bool) -> None:
     for index, group in enumerate(result["randomized_groups"], start=1):
         macs = ", ".join(group.macs)
         print(f"  {index}. {len(group.observations)} MAC(s): {macs}")
+
+    if result["low_confidence_randomized"]:
+        print("\nLow-confidence randomized MACs:")
+        for obs in result["low_confidence_randomized"]:
+            print(f"  - {obs.mac} ({obs.rssi if obs.rssi is not None else 'N/A'} dBm, {obs.zone})")
 
 
 def main() -> None:

@@ -66,8 +66,10 @@ class RandomizedSessionCounterTests(unittest.TestCase):
         result = estimate_occupancy(load_observations(csv_path))
 
         self.assertEqual(result["real_client_count"], 0)
+        self.assertEqual(result["randomized_raw_count"], 2)
         self.assertEqual(result["randomized_session_count"], 1)
         self.assertEqual(result["estimated_occupants"], 1)
+        self.assertEqual(result["estimated_occupant_range"], (1, 2))
 
     def test_does_not_merge_overlapping_randomized_sessions(self):
         csv_path = write_csv(
@@ -92,6 +94,7 @@ class RandomizedSessionCounterTests(unittest.TestCase):
 
         self.assertEqual(result["randomized_session_count"], 2)
         self.assertEqual(result["estimated_occupants"], 2)
+        self.assertEqual(result["estimated_occupant_range"], (2, 2))
 
     def test_does_not_merge_ie_fingerprint_alone(self):
         csv_path = write_csv(
@@ -146,6 +149,68 @@ class RandomizedSessionCounterTests(unittest.TestCase):
         self.assertEqual(result["real_client_count"], 1)
         self.assertEqual(result["randomized_session_count"], 1)
         self.assertEqual(result["estimated_occupants"], 2)
+
+    def test_reports_raw_counts_and_ignores_access_points(self):
+        csv_path = write_csv(
+            [
+                base_row(mac="00:11:22:33:44:55", mac_randomized="False"),
+                base_row(
+                    mac="02:11:22:33:44:55",
+                    mac_randomized="True",
+                    first_seen="10:02:00",
+                    last_seen="10:02:30",
+                ),
+                base_row(
+                    mac="aa:bb:cc:dd:ee:ff",
+                    type="Access Point",
+                    ssid="Office",
+                    mac_randomized="False",
+                ),
+            ]
+        )
+        self.addCleanup(csv_path.unlink)
+
+        result = estimate_occupancy(load_observations(csv_path))
+
+        self.assertEqual(result["raw_unique_macs"], 3)
+        self.assertEqual(result["access_point_count"], 1)
+        self.assertEqual(result["real_client_count"], 1)
+        self.assertEqual(result["randomized_raw_count"], 1)
+        self.assertEqual(result["estimated_occupant_range"], (2, 2))
+
+    def test_low_confidence_far_randomized_mac_only_affects_upper_bound(self):
+        csv_path = write_csv(
+            [
+                base_row(
+                    mac="02:11:22:33:44:55",
+                    mac_randomized="True",
+                    rssi_dbm="-84",
+                    zone="far        (>20 m)",
+                    probe_ssids="",
+                    packet_count="1",
+                    first_seen="10:02:00",
+                    last_seen="10:02:00",
+                ),
+                base_row(
+                    mac="06:11:22:33:44:55",
+                    mac_randomized="True",
+                    rssi_dbm="-52",
+                    zone="near       (2-7 m)",
+                    packet_count="3",
+                    first_seen="10:03:00",
+                    last_seen="10:03:30",
+                ),
+            ]
+        )
+        self.addCleanup(csv_path.unlink)
+
+        result = estimate_occupancy(load_observations(csv_path))
+
+        self.assertEqual(result["randomized_raw_count"], 2)
+        self.assertEqual(result["low_confidence_randomized_count"], 1)
+        self.assertEqual(result["randomized_session_count"], 1)
+        self.assertEqual(result["estimated_occupants"], 1)
+        self.assertEqual(result["estimated_occupant_range"], (1, 2))
 
 
 if __name__ == "__main__":

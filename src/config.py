@@ -25,7 +25,7 @@ Sections:
 # Examples:
 #   OUTPUT_DIR = "/home/pi/wifi_scans"     # absolute path (recommended)
 #   OUTPUT_DIR = "scans"                   # relative to wherever you run the script
-OUTPUT_DIR = "./csv_logs"         # ← edit this
+OUTPUT_DIR = "../csv_logs"         # ← edit this
 
 
 # ═══════════════════════════════════════════════════════════════════
