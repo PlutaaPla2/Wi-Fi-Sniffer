@@ -45,6 +45,32 @@ Detect Wi-Fi probe and client activity to estimate room occupancy for AC control
   - `python3 -m py_compile randomized_session_counter.py tests/test_randomized_session_counter.py` passed.
   - `python3 -m unittest discover` is blocked because `scapy` is not installed in the current environment.
 
+## 2026-06-24 night_sniffer_v2 first improvement pass
+
+- Improved `night_sniffer_v2.py` without replacing the existing live sniffing flow.
+- Kept the working parts: interface constants, channel hopper, packet CSV append, terminal client output, auto session report, and Scapy `sniff()` entry point.
+- Added richer evidence export for later randomized-client grouping:
+  - `IE_Sequence`
+  - `IE_Fingerprint`
+  - `Vendor_IEs`
+  - `Capabilities`
+  - `Band`
+- Added support for logging more client management frames:
+  - Probe request
+  - Association request
+  - Reassociation request
+  - Authentication
+  - Deauthentication
+  - Disassociation
+- Changed AP beacons to log-only for occupancy session tracking. Beacons are still useful environment context, but they should not create `User_*` sessions.
+- Expanded session summaries with full first/last timestamps, frame types, IE fingerprints, vendor IE OUIs, and RSSI min/max/average.
+- Important limitation kept intentionally: IE fingerprint is logged as evidence only. It is not treated as a unique identity yet, because similar phones can share the same IE sequence.
+- Verification run:
+  - `python3 -m py_compile night_sniffer_v2.py randomized_session_counter.py tests/test_randomized_session_counter.py` passed.
+  - `python3 -m unittest tests/test_randomized_session_counter.py` passed.
+  - `python3 -m unittest discover` is still blocked because `scapy` is not installed in the current environment.
+- Next step should be tests around `night_sniffer_v2.py` session behavior before changing its matching logic further.
+
 ## Important next tasks
 
 - Add full timestamps and RSSI statistics to future CSV exports: `first_seen_full`, `last_seen_full`, `rssi_min`, `rssi_max`, and `rssi_avg`.
