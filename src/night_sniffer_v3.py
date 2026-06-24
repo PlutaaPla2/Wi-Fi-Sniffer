@@ -11,6 +11,8 @@ import csv
 import math
 import logging
 import hashlib
+import argparse
+import subprocess
 from dataclasses import dataclass, field
 from scapy.all import sniff
 from scapy.layers.dot11 import (
@@ -31,6 +33,9 @@ P0              = -35     # Reference RSSI at 1 metre
 N               = 3.0     # Path-loss exponent (2.0 = open space, 3.0 = indoors)
 SESSION_TIMEOUT = 600     # Seconds before a session is considered expired
 AUTO_SAVE_INTERVAL = 60   # Seconds between auto-save of session summary
+GROUP_SCORE_THRESHOLD = 6
+OVERLAP_TOLERANCE_SECONDS = 5
+CHANNEL_HOP_INTERVAL = 0.5
 
 CLIENT_FRAME_TYPES = {
     "PROBE", "ASSOC_REQ", "REASSOC_REQ", "AUTH", "DEAUTH", "DISASSOC",
@@ -99,11 +104,13 @@ class Session:
     fingerprint: str = ""
     ie_fingerprints: set = field(default_factory=set)
     vendor_ies: set = field(default_factory=set)
+    mac_type: str = ""
     rssi: int = 0
     rssi_min: int = 0
     rssi_max: int = 0
     rssi_total: int = 0
     rssi_count: int = 0
+    zone: str = ""
     frame_types: set = field(default_factory=set)
     ssids: set = field(default_factory=set)
     first_ts: float = field(default_factory=time.time)
@@ -146,6 +153,19 @@ def calculate_distance(rssi: int) -> float:
         return round(math.pow(10, (P0 - rssi) / (10 * N)), 2)
     except (ValueError, ZeroDivisionError):
         return 0.0
+
+
+def proximity_zone(distance_m: float) -> str:
+    """Return a coarse room-distance bucket for grouping decisions."""
+    if distance_m <= 0:
+        return "unknown"
+    if distance_m <= 2:
+        return "immediate"
+    if distance_m <= 7:
+        return "near"
+    if distance_m <= 20:
+        return "mid"
+    return "far"
 
 
 def check_mac_type(mac: str) -> str:
@@ -201,19 +221,36 @@ def extract_ie_details(pkt) -> dict[str, str]:
     """
     Extract stable 802.11 information-element evidence for later grouping.
     The fingerprint is a weak signal, not a unique device identity.
+
+    This walks raw IE TLV bytes instead of Scapy's parsed Dot11Elt chain.
+    Scapy can stop exposing Dot11Elt layers after an unknown element, but the
+    bytes still follow [ID][length][data], so raw parsing preserves later IEs.
     """
     sequence: list[str] = []
     fingerprint_parts: list[str] = []
     vendor_ies: set[str] = set()
     capability_flags: set[str] = set()
 
-    el = pkt.getlayer(Dot11Elt)
-    while el:
-        try:
-            ie_id = int(getattr(el, "ID"))
-            info = bytes(getattr(el, "info", b"") or b"")
-        except Exception:
+    first_elt = pkt.getlayer(Dot11Elt)
+    if first_elt is None:
+        return {
+            "ie_sequence": "",
+            "ie_fingerprint": "",
+            "vendor_ies": "",
+            "capabilities": "",
+        }
+
+    raw_bytes = bytes(first_elt)
+    i = 0
+    while i + 1 < len(raw_bytes):
+        ie_id = raw_bytes[i]
+        ie_len = raw_bytes[i + 1]
+        data_start = i + 2
+        data_end = data_start + ie_len
+        if data_end > len(raw_bytes):
             break
+
+        info = raw_bytes[data_start:data_end]
 
         sequence.append(str(ie_id))
         fingerprint_parts.append(f"{ie_id}:{len(info)}:{info[:8].hex()}")
@@ -234,7 +271,7 @@ def extract_ie_details(pkt) -> dict[str, str]:
             if len(info) >= 4 and info[:4] == b"\x00\x50\xf2\x04":
                 capability_flags.add("WPS")
 
-        el = el.payload.getlayer(Dot11Elt)
+        i = data_end
 
     raw_fingerprint = "|".join(fingerprint_parts)
     ie_fingerprint = (
@@ -351,14 +388,164 @@ def _update_rssi_stats(session: Session, power: int) -> None:
     session.rssi_count += 1
 
 
+def _parse_set(value: str) -> set[str]:
+    """Parse semicolon/comma-separated evidence into a clean set."""
+    if not value:
+        return set()
+    normalized = value.replace(",", ";")
+    return {part.strip() for part in normalized.split(";") if part.strip()}
+
+
+def _sessions_overlap(left: Session, right_first_ts: float, right_last_ts: float) -> bool:
+    """Return True when two session windows overlap within the tolerance."""
+    return (
+        left.first_ts <= right_last_ts + OVERLAP_TOLERANCE_SECONDS
+        and right_first_ts <= left.last_ts + OVERLAP_TOLERANCE_SECONDS
+    )
+
+
+def _time_gap_seconds(left: Session, right_first_ts: float, right_last_ts: float) -> float:
+    """Return the gap between two non-overlapping windows, or 0 when touching."""
+    if left.last_ts <= right_first_ts:
+        return right_first_ts - left.last_ts
+    if right_last_ts <= left.first_ts:
+        return left.first_ts - right_last_ts
+    return 0
+
+
+def _same_randomized_session_score(
+    session: Session,
+    power: int,
+    zone: str,
+    ssids: set[str],
+    frame_type: str,
+    ie_fingerprint: str,
+    vendor_ies: set[str],
+    now: float,
+) -> tuple[int, list[str]]:
+    """Score whether a randomized MAC observation belongs to a prior session."""
+    score = 0
+    reasons: list[str] = []
+
+    if ie_fingerprint and session.ie_fingerprints:
+        if ie_fingerprint in session.ie_fingerprints:
+            score += 3
+            reasons.append("same IE fingerprint")
+        else:
+            score -= 3
+            reasons.append("different IE fingerprint")
+
+    if vendor_ies and session.vendor_ies:
+        if vendor_ies & session.vendor_ies:
+            score += 2
+            reasons.append("vendor IE overlap")
+        else:
+            score -= 1
+
+    if ssids and session.ssids:
+        if ssids & session.ssids:
+            score += 2
+            reasons.append("probe SSID overlap")
+        else:
+            score -= 1
+
+    if power and session.rssi:
+        rssi_delta = abs(session.rssi - power)
+        if rssi_delta <= 6:
+            score += 2
+            reasons.append("close RSSI")
+        elif rssi_delta <= 10:
+            score += 1
+            reasons.append("similar RSSI")
+        elif rssi_delta > 15:
+            score -= 1
+
+    if zone and zone != "unknown" and session.zone == zone:
+        score += 1
+        reasons.append("same zone")
+
+    if frame_type and frame_type in session.frame_types:
+        score += 1
+        reasons.append("frame type overlap")
+
+    gap = _time_gap_seconds(session, now, now)
+    if gap <= 120:
+        score += 1
+        reasons.append("nearby time window")
+    elif gap > 1800:
+        score -= 2
+
+    return score, reasons
+
+
+def _can_merge_randomized_session(
+    session: Session,
+    power: int,
+    zone: str,
+    ssids: set[str],
+    frame_type: str,
+    ie_fingerprint: str,
+    vendor_ies: set[str],
+    now: float,
+) -> tuple[bool, int, list[str]]:
+    """Apply the conservative randomized-session grouping rules."""
+    if _sessions_overlap(session, now, now):
+        return False, 0, ["overlapping randomized sessions"]
+
+    score, reasons = _same_randomized_session_score(
+        session, power, zone, ssids, frame_type, ie_fingerprint, vendor_ies, now
+    )
+    if score < GROUP_SCORE_THRESHOLD:
+        return False, score, reasons
+
+    supporting_reasons = {
+        "vendor IE overlap",
+        "probe SSID overlap",
+        "close RSSI",
+        "similar RSSI",
+        "same zone",
+        "frame type overlap",
+        "nearby time window",
+    }
+    support_count = len(supporting_reasons & set(reasons))
+    return support_count >= 2, score, reasons
+
+
+def _update_session(
+    session: Session,
+    mac: str,
+    power: int,
+    zone: str,
+    ssids: set[str],
+    frame_type: str,
+    ie_fingerprint: str,
+    vendor_ies: set[str],
+    now: float,
+) -> None:
+    """Merge one observation into an existing session."""
+    session.last_mac = mac
+    _update_rssi_stats(session, power)
+    if zone != "unknown":
+        session.zone = zone
+    session.last_ts = now
+    session.all_macs.add(mac)
+    session.ssids.update(ssids)
+    session.frame_types.add(frame_type)
+    if ie_fingerprint:
+        session.ie_fingerprints.add(ie_fingerprint)
+    session.vendor_ies.update(vendor_ies)
+
+
 def track_session(
     mac: str,
     identity: str,
     power: int,
+    zone: str,
     ssids: list[str],
     frame_type: str,
     ie_fingerprint: str,
     vendor_ies: str,
+    mac_type: str,
 ) -> str:
     """
     Match this observation to an existing session or create a new one.
@@ -367,26 +554,47 @@ def track_session(
     now = time.time()
     # Strip OUI noise for fingerprint comparison
     fingerprint = identity.split("[OUI:")[0].strip()
+    ssid_set = {ssid for ssid in ssids if ssid}
+    vendor_ie_set = _parse_set(vendor_ies)
 
     with _session_lock:
         _expire_sessions(now)
 
-        # Try to match by identity + RSSI proximity (±12 dBm).
-        # IE fingerprints are logged as evidence, not used alone as identity.
+        # The same source MAC is always the same live session while unexpired.
         for sid, session in active_sessions.items():
-            if (session.fingerprint == fingerprint
-                    and abs(session.rssi - power) <= 12):
-                session.last_mac = mac
-                _update_rssi_stats(session, power)
-                session.last_ts = now
-                session.all_macs.add(mac)
-                session.ssids.update(ssids)
-                session.frame_types.add(frame_type)
-                if ie_fingerprint:
-                    session.ie_fingerprints.add(ie_fingerprint)
-                if vendor_ies:
-                    session.vendor_ies.update(vendor_ies.split(";"))
+            if mac in session.all_macs:
+                _update_session(
+                    session, mac, power, zone, ssid_set, frame_type,
+                    ie_fingerprint, vendor_ie_set, now
+                )
                 return f"Existing-User-{sid}"
+
+        # Real MACs are stable enough to avoid identity/RSSI merging.
+        if mac_type == "Randomized":
+            best_sid: int | None = None
+            best_score = -99
+            best_reasons: list[str] = []
+            for sid, session in active_sessions.items():
+                if session.mac_type != "Randomized":
+                    continue
+                allowed, score, reasons = _can_merge_randomized_session(
+                    session, power, zone, ssid_set, frame_type,
+                    ie_fingerprint, vendor_ie_set, now
+                )
+                if allowed and score > best_score:
+                    best_sid = sid
+                    best_score = score
+                    best_reasons = reasons
+
+            if best_sid is not None:
+                session = active_sessions[best_sid]
+                _update_session(
+                    session, mac, power, zone, ssid_set, frame_type,
+                    ie_fingerprint, vendor_ie_set, now
+                )
+                reason_text = ", ".join(best_reasons) if best_reasons else "matched evidence"
+                log.debug("Merged randomized MAC %s into User-%s: %s", mac, best_sid, reason_text)
+                return f"Existing-User-{best_sid}"
 
         # No match → new session
         new_id = max(active_sessions.keys(), default=0) + 1
@@ -395,9 +603,11 @@ def track_session(
             all_macs={mac},
             fingerprint=fingerprint,
             ie_fingerprints={ie_fingerprint} if ie_fingerprint else set(),
-            vendor_ies=set(vendor_ies.split(";")) if vendor_ies else set(),
+            vendor_ies=vendor_ie_set,
+            mac_type=mac_type,
             frame_types={frame_type},
-            ssids=set(ssids),
+            ssids=ssid_set,
+            zone=zone,
             first_ts=now,
             last_ts=now,
         )
@@ -534,6 +744,7 @@ def handle_packet(pkt) -> None:
     # --- Derived fields ---
     timestamp    = time.strftime("%Y-%m-%d %H:%M:%S")
     dist_m       = calculate_distance(power)
+    zone         = proximity_zone(dist_m)
     mac_type     = check_mac_type(mac_addr)
     vendor       = get_vendor(mac_addr, mac_type)
     now          = time.time()
@@ -544,8 +755,8 @@ def handle_packet(pkt) -> None:
     ie_details   = extract_ie_details(pkt)
     if pkt_type in CLIENT_FRAME_TYPES:
         session_note = track_session(
-            mac_addr, identity, power, [ssid], pkt_type,
-            ie_details["ie_fingerprint"], ie_details["vendor_ies"],
+            mac_addr, identity, power, zone, [ssid], pkt_type,
+            ie_details["ie_fingerprint"], ie_details["vendor_ies"], mac_type,
         )
     else:
         session_note = "AP-Logged-Only"
@@ -579,8 +790,16 @@ def channel_hopper() -> None:
     log.info(f"Channel hopper started on {INTERFACE}")
     while True:
         for ch in range(1, 14):
-            os.system(f"iw dev {INTERFACE} set channel {ch} 2>/dev/null")
-            time.sleep(0.5)
+            result = subprocess.run(
+                ["iw", "dev", INTERFACE, "set", "channel", str(ch)],
+                check=False,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            if result.returncode != 0:
+                log.warning("Channel hop to %s failed: %s", ch, result.stderr.strip())
+            time.sleep(CHANNEL_HOP_INTERVAL)
 
 
 def auto_report_worker() -> None:
@@ -596,6 +815,14 @@ def auto_report_worker() -> None:
 # ---------------------------------------------------------------------------
 
 def main() -> None:
+    parser = argparse.ArgumentParser(description="Passive Wi-Fi reconnaissance capture.")
+    parser.add_argument(
+        "--hop",
+        action="store_true",
+        help="Enable active channel hopping with iw. Disabled by default.",
+    )
+    args = parser.parse_args()
+
     setup_csv()
 
     log.info(f"Starting WiFi Recon on interface: {INTERFACE}")
@@ -607,7 +834,10 @@ def main() -> None:
           f"{'Pwr':>4} | {'Dist':>5} | SSID")
     print(sep)
 
-    threading.Thread(target=channel_hopper,    daemon=True).start()
+    if args.hop:
+        threading.Thread(target=channel_hopper, daemon=True).start()
+    else:
+        log.info("Channel hopping disabled. Use --hop to rotate channels.")
     threading.Thread(target=auto_report_worker, daemon=True).start()
 
     try:
