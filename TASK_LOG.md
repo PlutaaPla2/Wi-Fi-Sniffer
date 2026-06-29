@@ -78,3 +78,13 @@ Detect Wi-Fi probe and client activity to estimate room occupancy for AC control
 - Test the counter with controlled real-room captures: one phone, two similar phones, two same-model phones at the same time, empty room, and nearby hallway traffic.
 - Tune the low-confidence filter and grouping threshold using real captures before using the output for AC control.
 - After the post-processing estimator is trusted, consider adding rolling occupancy output to `wifi_sniffer.py`.
+
+## 2026-06-29 docs Night v3 explanation update
+
+- Reworked `docs/index.html` into two top-level tabs:
+  - Wi-Fi Sniffer explanation for the original passive sniffer walkthrough.
+  - Night v3 explanation for `src/night_sniffer_v3.py`.
+- Added a Night v3 language switch so the explanation can be read in English or Thai.
+- Added Thai Night v3 content focused on simple concepts: packet flow, RSSI/proximity, IE fingerprinting, randomized MAC session grouping, and the safest reading order for the code.
+- Kept the documentation static with no external dependencies, so it can still be opened directly from the local `docs/index.html` file.
+- Next documentation task: review the Thai wording with real users after they read the page once, then tighten any confusing terms around session scoring and randomized MAC grouping.
