@@ -32,7 +32,7 @@ INTERFACE          = "wlan1"
 # Use an absolute path to write outside the working directory, e.g.:
 #   LOG_FILE        = "/home/pi/logs/wifi_full_recon_report.csv"
 #   SUMMARY_DIR     = "/home/pi/logs"
-LOG_FILE           = "wifi_full_recon_report.csv"   # main per-packet log
+LOG_FILE           = "./csv_analyze/wifi_full_recon_report.csv"   # main per-packet log
 SUMMARY_DIR        = "./csv_analyze/"                             # directory for daily_summary_DATE.csv files
 SUMMARY_PREFIX     = "daily_summary"                 # filename prefix (date appended automatically)
 P0                 = -35    # Reference RSSI at 1 metre
