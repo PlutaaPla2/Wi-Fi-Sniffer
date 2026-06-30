@@ -27,8 +27,14 @@ from mac_vendor_lookup import MacLookup
 # ---------------------------------------------------------------------------
 
 INTERFACE          = "wlan1"
-LOG_FILE           = "wifi_full_recon_report.csv"
-SUMMARY_PREFIX     = "daily_summary"
+
+# ── Output file paths (edit these to change where CSVs are written) ──────────
+# Use an absolute path to write outside the working directory, e.g.:
+#   LOG_FILE        = "/home/pi/logs/wifi_full_recon_report.csv"
+#   SUMMARY_DIR     = "/home/pi/logs"
+LOG_FILE           = "wifi_full_recon_report.csv"   # main per-packet log
+SUMMARY_DIR        = "./csv_analyze/"                             # directory for daily_summary_DATE.csv files
+SUMMARY_PREFIX     = "daily_summary"                 # filename prefix (date appended automatically)
 P0                 = -35    # Reference RSSI at 1 metre
 N                  = 3.0    # Path-loss exponent (2.0 open space, 3.0 indoors)
 SESSION_TIMEOUT    = 600    # Seconds before a session is considered expired
@@ -651,7 +657,7 @@ def track_session(
 
 def generate_session_report() -> None:
     """Write a human-friendly daily summary CSV of active sessions."""
-    report_file = f"{SUMMARY_PREFIX}_{time.strftime('%Y%m%d')}.csv"
+    report_file = os.path.join(SUMMARY_DIR, f"{SUMMARY_PREFIX}_{time.strftime('%Y%m%d')}.csv")
     with _session_lock:
         rows = list(active_sessions.items())
 
