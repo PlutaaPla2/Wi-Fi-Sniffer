@@ -16,7 +16,8 @@ import subprocess
 from dataclasses import dataclass, field
 from scapy.all import sniff
 from scapy.layers.dot11 import (
-    Dot11, Dot11ProbeReq, Dot11Beacon, Dot11AssoReq, Dot11ReassoReq,
+    Dot11, Dot11ProbeReq, Dot11Beacon,
+    Dot11AssoReq, Dot11AssoResp, Dot11ReassoReq, Dot11ReassoResp,
     Dot11Auth, Dot11Deauth, Dot11Disas, RadioTap,
     Dot11Elt, Dot11EltVendorSpecific
 )
@@ -33,6 +34,7 @@ INTERFACE          = "wlan1"
 #   LOG_FILE        = "/home/pi/logs/wifi_full_recon_report.csv"
 #   SUMMARY_DIR     = "/home/pi/logs"
 LOG_FILE           = "./csv_analyze/wifi_full_recon_report.csv"   # main per-packet log
+IE_DETAILS_FILE    = "./csv_analyze/ie_details_report.csv"        # one row per information element
 SUMMARY_DIR        = "./csv_analyze/"                             # directory for daily_summary_DATE.csv files
 SUMMARY_PREFIX     = "daily_summary"                 # filename prefix (date appended automatically)
 P0                 = -35    # Reference RSSI at 1 metre
@@ -60,6 +62,43 @@ CSV_FIELDS = [
     "Interval_sec", "IE_Sequence", "IE_Fingerprint", "Vendor_IEs",
     "Capabilities", "Note", "Session_Note",
 ]
+
+# Column layout for the per-IE breakdown file (one row per information element).
+IE_CSV_FIELDS = [
+    "Timestamp", "Pkt_Type", "MAC_Address", "IE_Index", "IE_ID",
+    "IE_Name", "IE_Length", "IE_Raw_Hex", "IE_Decoded",
+]
+
+# Human-readable names for the 802.11 information-element IDs we care about.
+IE_NAMES: dict[int, str] = {
+    0:   "SSID",
+    1:   "Supported Rates",
+    3:   "DS Parameter Set",
+    5:   "TIM",
+    7:   "Country",
+    11:  "QBSS Load",
+    32:  "Power Constraint",
+    33:  "Power Capability",
+    35:  "TPC Report",
+    36:  "Supported Channels",
+    42:  "ERP Info",
+    45:  "HT Capabilities",
+    48:  "RSN",
+    50:  "Extended Supported Rates",
+    54:  "Mobility Domain",
+    59:  "Supported Operating Classes",
+    61:  "HT Operation",
+    70:  "RM Enabled Capabilities",
+    74:  "Overlapping BSS Scan Params",
+    107: "Interworking",
+    108: "Advertisement Protocol",
+    127: "Extended Capabilities",
+    191: "VHT Capabilities",
+    192: "VHT Operation",
+    195: "VHT Tx Power Envelope",
+    221: "Vendor Specific",
+    255: "Element Extension",
+}
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -156,6 +195,13 @@ def setup_csv() -> None:
     if not os.path.exists(LOG_FILE):
         with open(LOG_FILE, "w", newline="") as fh:
             csv.writer(fh).writerow(CSV_FIELDS)
+
+
+def setup_ie_csv() -> None:
+    """Create the per-IE breakdown CSV with its header row if absent."""
+    if not os.path.exists(IE_DETAILS_FILE):
+        with open(IE_DETAILS_FILE, "w", newline="") as fh:
+            csv.writer(fh).writerow(IE_CSV_FIELDS)
 
 
 def calculate_distance(rssi: int) -> float:
@@ -267,27 +313,17 @@ def reset_monitor_mode(iface: str) -> None:
 # Packet fingerprinting
 # ---------------------------------------------------------------------------
 
-def extract_ie_details(pkt) -> dict[str, str]:
+def _iter_ies(pkt):
     """
-    Extract stable 802.11 information-element evidence for later grouping.
+    Yield ``(ie_id, info_bytes)`` for every 802.11 information element in a frame.
 
     Walks raw TLV bytes instead of Scapy's Dot11Elt chain — Scapy can stop
     producing Dot11Elt objects after an unknown element and fall back to Raw,
     silently dropping later IEs. The raw [ID][len][data] walk recovers all of them.
     """
-    sequence: list[str] = []
-    fingerprint_parts: list[str] = []
-    vendor_ies: set[str] = set()
-    capability_flags: set[str] = set()
-
     first_elt = pkt.getlayer(Dot11Elt)
     if first_elt is None:
-        return {
-            "ie_sequence": "",
-            "ie_fingerprint": "",
-            "vendor_ies": "",
-            "capabilities": "",
-        }
+        return
 
     raw_bytes = bytes(first_elt)
     i = 0
@@ -298,8 +334,20 @@ def extract_ie_details(pkt) -> dict[str, str]:
         data_end   = data_start + ie_len
         if data_end > len(raw_bytes):
             break
+        yield ie_id, raw_bytes[data_start:data_end]
+        i = data_end
 
-        info = raw_bytes[data_start:data_end]
+
+def extract_ie_details(pkt) -> dict[str, str]:
+    """
+    Extract stable 802.11 information-element evidence for later grouping.
+    """
+    sequence: list[str] = []
+    fingerprint_parts: list[str] = []
+    vendor_ies: set[str] = set()
+    capability_flags: set[str] = set()
+
+    for ie_id, info in _iter_ies(pkt):
         sequence.append(str(ie_id))
         fingerprint_parts.append(f"{ie_id}:{len(info)}:{info[:8].hex()}")
 
@@ -319,8 +367,6 @@ def extract_ie_details(pkt) -> dict[str, str]:
             if len(info) >= 4 and info[:4] == b"\x00\x50\xf2\x04":
                 capability_flags.add("WPS")
 
-        i = data_end
-
     raw_fingerprint = "|".join(fingerprint_parts)
     ie_fingerprint  = (
         hashlib.sha1(raw_fingerprint.encode("ascii")).hexdigest()[:16]
@@ -333,6 +379,54 @@ def extract_ie_details(pkt) -> dict[str, str]:
         "vendor_ies":   ";".join(sorted(vendor_ies)),
         "capabilities": ";".join(sorted(capability_flags)),
     }
+
+
+def _decode_ie(ie_id: int, info: bytes) -> str:
+    """
+    Best-effort human-readable decode of a single information element's payload.
+
+    Only the common, cheaply-decodable tags are expanded; everything else
+    returns an empty string and callers fall back to the raw hex column.
+    """
+    try:
+        if ie_id == 0:  # SSID
+            return info.decode("utf-8", errors="ignore") or "(Wildcard/Hidden)"
+        if ie_id in (1, 50):  # (Extended) Supported Rates, in 0.5 Mbps units
+            rates = [f"{(b & 0x7f) / 2:g}" for b in info]
+            return "Mbps: " + ",".join(rates) if rates else ""
+        if ie_id == 3 and info:  # DS Parameter Set
+            return f"Channel {info[0]}"
+        if ie_id == 7 and len(info) >= 2:  # Country
+            return "Country " + info[:2].decode("ascii", errors="ignore")
+        if ie_id == 42 and info:  # ERP Info
+            return f"ERP 0x{info[0]:02x}"
+        if ie_id == 221 and len(info) >= 3:  # Vendor Specific
+            oui = ":".join(f"{b:02x}" for b in info[:3])
+            return f"OUI {oui} ({lookup_oui(oui)})"
+    except Exception:
+        return ""
+    return ""
+
+
+def dump_ie_details(pkt, timestamp: str, pkt_type: str, mac_addr: str) -> None:
+    """
+    Append one row per 802.11 information element to IE_DETAILS_FILE.
+
+    Where the main recon log records a single row per packet, this breaks each
+    frame down tag-by-tag so the raw content of every IE can be inspected
+    offline — especially useful for the richer association/probe frames.
+    """
+    rows = []
+    for index, (ie_id, info) in enumerate(_iter_ies(pkt)):
+        rows.append([
+            timestamp, pkt_type, mac_addr, index, ie_id,
+            IE_NAMES.get(ie_id, f"Unknown({ie_id})"),
+            len(info), info.hex(), _decode_ie(ie_id, info),
+        ])
+    if not rows:
+        return
+    with open(IE_DETAILS_FILE, "a", newline="") as fh:
+        csv.writer(fh).writerows(rows)
 
 
 def extract_ssid(pkt, fallback: str) -> str:
@@ -727,33 +821,44 @@ def _pick_colour(identity: str) -> str:
     return COLOUR_YELLOW
 
 
+def classify_frame(pkt) -> tuple[str | None, str]:
+    """
+    Identify a supported 802.11 management frame and its source MAC.
+
+    Catches the association family in full, including the rarely-captured
+    association/reassociation *response* frames the AP sends back to a client
+    (ASSOC_RESP / REASSOC_RESP) — these only appear during the brief connection
+    handshake, so they seldom show up in a passive capture. Returns
+    ``(pkt_type, mac_addr)`` or ``(None, "")`` for frames we don't track.
+
+    Ordered so the more specific *response* checks run before the request
+    layers they subclass, avoiding misclassification.
+    """
+    if pkt.haslayer(Dot11Beacon):
+        return "BEACON", _safe_upper_mac(pkt.addr3)
+    if pkt.haslayer(Dot11ProbeReq):
+        return "PROBE", _safe_upper_mac(pkt.addr2)
+    if pkt.haslayer(Dot11AssoResp):
+        return "ASSOC_RESP", _safe_upper_mac(pkt.addr2)
+    if pkt.haslayer(Dot11AssoReq):
+        return "ASSOC_REQ", _safe_upper_mac(pkt.addr2)
+    if pkt.haslayer(Dot11ReassoResp):
+        return "REASSOC_RESP", _safe_upper_mac(pkt.addr2)
+    if pkt.haslayer(Dot11ReassoReq):
+        return "REASSOC_REQ", _safe_upper_mac(pkt.addr2)
+    if pkt.haslayer(Dot11Auth):
+        return "AUTH", _safe_upper_mac(pkt.addr2)
+    if pkt.haslayer(Dot11Deauth):
+        return "DEAUTH", _safe_upper_mac(pkt.addr2)
+    if pkt.haslayer(Dot11Disas):
+        return "DISASSOC", _safe_upper_mac(pkt.addr2)
+    return None, ""
+
+
 def handle_packet(pkt) -> None:
     """Process each captured 802.11 frame."""
-    if pkt.haslayer(Dot11Beacon):
-        pkt_type = "BEACON"
-        mac_addr = _safe_upper_mac(pkt.addr3)
-    elif pkt.haslayer(Dot11ProbeReq):
-        pkt_type = "PROBE"
-        mac_addr = _safe_upper_mac(pkt.addr2)
-    elif pkt.haslayer(Dot11AssoReq):
-        pkt_type = "ASSOC_REQ"
-        mac_addr = _safe_upper_mac(pkt.addr2)
-    elif pkt.haslayer(Dot11ReassoReq):
-        pkt_type = "REASSOC_REQ"
-        mac_addr = _safe_upper_mac(pkt.addr2)
-    elif pkt.haslayer(Dot11Auth):
-        pkt_type = "AUTH"
-        mac_addr = _safe_upper_mac(pkt.addr2)
-    elif pkt.haslayer(Dot11Deauth):
-        pkt_type = "DEAUTH"
-        mac_addr = _safe_upper_mac(pkt.addr2)
-    elif pkt.haslayer(Dot11Disas):
-        pkt_type = "DISASSOC"
-        mac_addr = _safe_upper_mac(pkt.addr2)
-    else:
-        return
-
-    if not mac_addr:
+    pkt_type, mac_addr = classify_frame(pkt)
+    if pkt_type is None or not mac_addr:
         return
 
     ssid = extract_ssid(
@@ -808,6 +913,8 @@ def handle_packet(pkt) -> None:
         final_note,
     ])
 
+    dump_ie_details(pkt, timestamp, pkt_type, mac_addr)
+
 
 # ---------------------------------------------------------------------------
 # Background threads
@@ -852,9 +959,11 @@ def main() -> None:
     args = parser.parse_args()
 
     setup_csv()
+    setup_ie_csv()
 
     log.info("Starting WiFi Recon on interface: %s", INTERFACE)
     log.info("Logging packets to            : %s", LOG_FILE)
+    log.info("Logging IE breakdown to       : %s", IE_DETAILS_FILE)
     log.info("Max reconnect attempts        : %d", MAX_RETRIES)
 
     sep = "-" * 110
