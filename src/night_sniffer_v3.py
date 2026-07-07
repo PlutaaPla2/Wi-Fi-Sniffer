@@ -11,10 +11,13 @@ import csv
 import math
 import logging
 import hashlib
+import argparse
+import subprocess
 from dataclasses import dataclass, field
 from scapy.all import sniff
 from scapy.layers.dot11 import (
-    Dot11, Dot11ProbeReq, Dot11Beacon, Dot11AssoReq, Dot11ReassoReq,
+    Dot11, Dot11ProbeReq, Dot11Beacon,
+    Dot11AssoReq, Dot11AssoResp, Dot11ReassoReq, Dot11ReassoResp,
     Dot11Auth, Dot11Deauth, Dot11Disas, RadioTap,
     Dot11Elt, Dot11EltVendorSpecific
 )
@@ -24,13 +27,30 @@ from mac_vendor_lookup import MacLookup
 # Configuration
 # ---------------------------------------------------------------------------
 
-INTERFACE       = "wlan1"
-LOG_FILE        = "wifi_full_recon_report.csv"
-SUMMARY_PREFIX  = "daily_summary"
-P0              = -35     # Reference RSSI at 1 metre
-N               = 3.0     # Path-loss exponent (2.0 = open space, 3.0 = indoors)
-SESSION_TIMEOUT = 600     # Seconds before a session is considered expired
-AUTO_SAVE_INTERVAL = 60   # Seconds between auto-save of session summary
+INTERFACE          = "wlan1"
+
+# ── Output file paths (edit these to change where CSVs are written) ──────────
+# Use an absolute path to write outside the working directory, e.g.:
+#   LOG_FILE        = "/home/pi/logs/wifi_full_recon_report.csv"
+#   SUMMARY_DIR     = "/home/pi/logs"
+LOG_FILE           = "./csv_analyze/wifi_full_recon_report.csv"   # main per-packet log
+IE_DETAILS_FILE    = "./csv_analyze/ie_details_report.csv"        # one row per information element
+SUMMARY_DIR        = "./csv_analyze/"                             # directory for daily_summary_DATE.csv files
+SUMMARY_PREFIX     = "daily_summary"                 # filename prefix (date appended automatically)
+P0                 = -35    # Reference RSSI at 1 metre
+N                  = 3.0    # Path-loss exponent (2.0 open space, 3.0 indoors)
+SESSION_TIMEOUT    = 600    # Seconds before a session is considered expired
+AUTO_SAVE_INTERVAL = 60     # Seconds between auto-save of session summary
+GROUP_SCORE_THRESHOLD      = 6
+OVERLAP_TOLERANCE_SECONDS  = 5
+CHANNEL_HOP_INTERVAL       = 0.5
+
+# ── Interface recovery ────────────────────────────────────────────────────────
+# When sniff() exits unexpectedly (the adapter drops out of monitor mode),
+# the script waits RETRY_DELAY seconds, resets the interface, then tries again.
+# It gives up after MAX_RETRIES consecutive failures.
+MAX_RETRIES  = 10   # maximum reconnect attempts before giving up
+RETRY_DELAY  = 3    # seconds to wait between each attempt
 
 CLIENT_FRAME_TYPES = {
     "PROBE", "ASSOC_REQ", "REASSOC_REQ", "AUTH", "DEAUTH", "DISASSOC",
@@ -42,6 +62,43 @@ CSV_FIELDS = [
     "Interval_sec", "IE_Sequence", "IE_Fingerprint", "Vendor_IEs",
     "Capabilities", "Note", "Session_Note",
 ]
+
+# Column layout for the per-IE breakdown file (one row per information element).
+IE_CSV_FIELDS = [
+    "Timestamp", "Pkt_Type", "MAC_Address", "IE_Index", "IE_ID",
+    "IE_Name", "IE_Length", "IE_Raw_Hex", "IE_Decoded",
+]
+
+# Human-readable names for the 802.11 information-element IDs we care about.
+IE_NAMES: dict[int, str] = {
+    0:   "SSID",
+    1:   "Supported Rates",
+    3:   "DS Parameter Set",
+    5:   "TIM",
+    7:   "Country",
+    11:  "QBSS Load",
+    32:  "Power Constraint",
+    33:  "Power Capability",
+    35:  "TPC Report",
+    36:  "Supported Channels",
+    42:  "ERP Info",
+    45:  "HT Capabilities",
+    48:  "RSN",
+    50:  "Extended Supported Rates",
+    54:  "Mobility Domain",
+    59:  "Supported Operating Classes",
+    61:  "HT Operation",
+    70:  "RM Enabled Capabilities",
+    74:  "Overlapping BSS Scan Params",
+    107: "Interworking",
+    108: "Advertisement Protocol",
+    127: "Extended Capabilities",
+    191: "VHT Capabilities",
+    192: "VHT Operation",
+    195: "VHT Tx Power Envelope",
+    221: "Vendor Specific",
+    255: "Element Extension",
+}
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -83,10 +140,10 @@ KNOWN_OUIS: dict[str, str] = {
 
 # ANSI colour codes
 COLOUR_RESET  = "\033[0m"
-COLOUR_RED    = "\033[91m"   # Apple
-COLOUR_BLUE   = "\033[94m"   # Samsung
-COLOUR_YELLOW = "\033[93m"   # Other known vendors
-COLOUR_GREY   = "\033[90m"   # Unknown / generic
+COLOUR_RED    = "\033[91m"
+COLOUR_BLUE   = "\033[94m"
+COLOUR_YELLOW = "\033[93m"
+COLOUR_GREY   = "\033[90m"
 
 # ---------------------------------------------------------------------------
 # Session data
@@ -99,11 +156,13 @@ class Session:
     fingerprint: str = ""
     ie_fingerprints: set = field(default_factory=set)
     vendor_ies: set = field(default_factory=set)
+    mac_type: str = ""
     rssi: int = 0
     rssi_min: int = 0
     rssi_max: int = 0
     rssi_total: int = 0
     rssi_count: int = 0
+    zone: str = ""
     frame_types: set = field(default_factory=set)
     ssids: set = field(default_factory=set)
     first_ts: float = field(default_factory=time.time)
@@ -138,6 +197,13 @@ def setup_csv() -> None:
             csv.writer(fh).writerow(CSV_FIELDS)
 
 
+def setup_ie_csv() -> None:
+    """Create the per-IE breakdown CSV with its header row if absent."""
+    if not os.path.exists(IE_DETAILS_FILE):
+        with open(IE_DETAILS_FILE, "w", newline="") as fh:
+            csv.writer(fh).writerow(IE_CSV_FIELDS)
+
+
 def calculate_distance(rssi: int) -> float:
     """Estimate distance (metres) from RSSI using the log-distance path-loss model."""
     if not rssi:
@@ -146,6 +212,19 @@ def calculate_distance(rssi: int) -> float:
         return round(math.pow(10, (P0 - rssi) / (10 * N)), 2)
     except (ValueError, ZeroDivisionError):
         return 0.0
+
+
+def proximity_zone(distance_m: float) -> str:
+    """Return a coarse room-distance bucket for grouping decisions."""
+    if distance_m <= 0:
+        return "unknown"
+    if distance_m <= 2:
+        return "immediate"
+    if distance_m <= 7:
+        return "near"
+    if distance_m <= 20:
+        return "mid"
+    return "far"
 
 
 def check_mac_type(mac: str) -> str:
@@ -194,27 +273,81 @@ def _safe_upper_mac(mac: str | None) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Interface recovery
+# ---------------------------------------------------------------------------
+
+def reset_monitor_mode(iface: str) -> None:
+    """
+    Re-establish monitor mode after the adapter drops out.
+
+    Runs three commands in sequence — the same ones you'd type manually:
+        ip link set <iface> down
+        iw dev <iface> set type monitor
+        ip link set <iface> up
+
+    Uses subprocess.run (already used in channel_hopper) rather than
+    os.system so we get a return code and can log failures cleanly.
+    A 1-second sleep after bringing the interface back up gives the
+    kernel/driver time to settle before sniff() is called again.
+    """
+    log.warning("Attempting to reset monitor mode on %s …", iface)
+    commands = [
+        ["ip",  "link", "set", iface, "down"],
+        ["iw",  "dev",  iface, "set", "type", "monitor"],
+        ["ip",  "link", "set", iface, "up"],
+    ]
+    for cmd in commands:
+        result = subprocess.run(
+            cmd,
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        if result.returncode != 0:
+            log.warning("  cmd %s failed: %s", " ".join(cmd), result.stderr.strip())
+    time.sleep(1)
+
+
+# ---------------------------------------------------------------------------
 # Packet fingerprinting
 # ---------------------------------------------------------------------------
+
+def _iter_ies(pkt):
+    """
+    Yield ``(ie_id, info_bytes)`` for every 802.11 information element in a frame.
+
+    Walks raw TLV bytes instead of Scapy's Dot11Elt chain — Scapy can stop
+    producing Dot11Elt objects after an unknown element and fall back to Raw,
+    silently dropping later IEs. The raw [ID][len][data] walk recovers all of them.
+    """
+    first_elt = pkt.getlayer(Dot11Elt)
+    if first_elt is None:
+        return
+
+    raw_bytes = bytes(first_elt)
+    i = 0
+    while i + 1 < len(raw_bytes):
+        ie_id      = raw_bytes[i]
+        ie_len     = raw_bytes[i + 1]
+        data_start = i + 2
+        data_end   = data_start + ie_len
+        if data_end > len(raw_bytes):
+            break
+        yield ie_id, raw_bytes[data_start:data_end]
+        i = data_end
+
 
 def extract_ie_details(pkt) -> dict[str, str]:
     """
     Extract stable 802.11 information-element evidence for later grouping.
-    The fingerprint is a weak signal, not a unique device identity.
     """
     sequence: list[str] = []
     fingerprint_parts: list[str] = []
     vendor_ies: set[str] = set()
     capability_flags: set[str] = set()
 
-    el = pkt.getlayer(Dot11Elt)
-    while el:
-        try:
-            ie_id = int(getattr(el, "ID"))
-            info = bytes(getattr(el, "info", b"") or b"")
-        except Exception:
-            break
-
+    for ie_id, info in _iter_ies(pkt):
         sequence.append(str(ie_id))
         fingerprint_parts.append(f"{ie_id}:{len(info)}:{info[:8].hex()}")
 
@@ -234,27 +367,73 @@ def extract_ie_details(pkt) -> dict[str, str]:
             if len(info) >= 4 and info[:4] == b"\x00\x50\xf2\x04":
                 capability_flags.add("WPS")
 
-        el = el.payload.getlayer(Dot11Elt)
-
     raw_fingerprint = "|".join(fingerprint_parts)
-    ie_fingerprint = (
+    ie_fingerprint  = (
         hashlib.sha1(raw_fingerprint.encode("ascii")).hexdigest()[:16]
         if raw_fingerprint else ""
     )
 
     return {
-        "ie_sequence": ",".join(sequence),
+        "ie_sequence":  ",".join(sequence),
         "ie_fingerprint": ie_fingerprint,
-        "vendor_ies": ";".join(sorted(vendor_ies)),
+        "vendor_ies":   ";".join(sorted(vendor_ies)),
         "capabilities": ";".join(sorted(capability_flags)),
     }
+
+
+def _decode_ie(ie_id: int, info: bytes) -> str:
+    """
+    Best-effort human-readable decode of a single information element's payload.
+
+    Only the common, cheaply-decodable tags are expanded; everything else
+    returns an empty string and callers fall back to the raw hex column.
+    """
+    try:
+        if ie_id == 0:  # SSID
+            return info.decode("utf-8", errors="ignore") or "(Wildcard/Hidden)"
+        if ie_id in (1, 50):  # (Extended) Supported Rates, in 0.5 Mbps units
+            rates = [f"{(b & 0x7f) / 2:g}" for b in info]
+            return "Mbps: " + ",".join(rates) if rates else ""
+        if ie_id == 3 and info:  # DS Parameter Set
+            return f"Channel {info[0]}"
+        if ie_id == 7 and len(info) >= 2:  # Country
+            return "Country " + info[:2].decode("ascii", errors="ignore")
+        if ie_id == 42 and info:  # ERP Info
+            return f"ERP 0x{info[0]:02x}"
+        if ie_id == 221 and len(info) >= 3:  # Vendor Specific
+            oui = ":".join(f"{b:02x}" for b in info[:3])
+            return f"OUI {oui} ({lookup_oui(oui)})"
+    except Exception:
+        return ""
+    return ""
+
+
+def dump_ie_details(pkt, timestamp: str, pkt_type: str, mac_addr: str) -> None:
+    """
+    Append one row per 802.11 information element to IE_DETAILS_FILE.
+
+    Where the main recon log records a single row per packet, this breaks each
+    frame down tag-by-tag so the raw content of every IE can be inspected
+    offline — especially useful for the richer association/probe frames.
+    """
+    rows = []
+    for index, (ie_id, info) in enumerate(_iter_ies(pkt)):
+        rows.append([
+            timestamp, pkt_type, mac_addr, index, ie_id,
+            IE_NAMES.get(ie_id, f"Unknown({ie_id})"),
+            len(info), info.hex(), _decode_ie(ie_id, info),
+        ])
+    if not rows:
+        return
+    with open(IE_DETAILS_FILE, "a", newline="") as fh:
+        csv.writer(fh).writerows(rows)
 
 
 def extract_ssid(pkt, fallback: str) -> str:
     """Read SSID from packet info or SSID information element."""
     raw_ssid = getattr(pkt, "info", b"") or b""
     if not raw_ssid:
-        ssid_el = pkt.getlayer(Dot11Elt, ID=0)
+        ssid_el  = pkt.getlayer(Dot11Elt, ID=0)
         raw_ssid = getattr(ssid_el, "info", b"") if ssid_el else b""
     try:
         return raw_ssid.decode("utf-8", errors="ignore") or fallback
@@ -267,35 +446,33 @@ def get_correlation_identity(pkt) -> str:
     Derive a human-readable device identity from a Probe Request or Beacon.
     Priority: Vendor Specific Tag (221) > MAC OUI > generic fallback.
     """
-    vendor = "Generic"
-    region = "Unknown"
+    vendor       = "Generic"
+    region       = "Unknown"
     device_class = "IoT/Low-End"
-    is_apple = False
-    is_windows = False
-    found_oui = "None"
+    is_apple     = False
+    is_windows   = False
+    found_oui    = "None"
 
-    # --- Step 1: MAC OUI as baseline ---
     try:
         src_mac = _safe_upper_mac(getattr(pkt, "addr2", None))
         if not src_mac:
             src_mac = _safe_upper_mac(getattr(pkt, "addr3", None))
         mac_oui = oui_from_mac(src_mac)
-        vendor = lookup_oui(mac_oui)
+        vendor  = lookup_oui(mac_oui)
     except Exception:
         pass
 
     if pkt.haslayer(Dot11Elt):
-        # --- Step 2: Vendor Specific Tag (ID 221) ---
         el = pkt.getlayer(Dot11EltVendorSpecific)
         while el:
             try:
                 raw_oui = el.oui
                 if isinstance(raw_oui, int):
-                    oui_str = oui_int_to_str(raw_oui)
-                    found_oui = oui_str
+                    oui_str    = oui_int_to_str(raw_oui)
+                    found_oui  = oui_str
                     tag_vendor = lookup_oui(oui_str)
                     if "Unknown" not in tag_vendor:
-                        vendor = tag_vendor          # Tag trumps MAC OUI
+                        vendor = tag_vendor
                     if raw_oui == 0x0017F2:
                         is_apple = True
                     if raw_oui == 0x0050F2:
@@ -304,15 +481,13 @@ def get_correlation_identity(pkt) -> str:
                 pass
             el = el.payload.getlayer(Dot11EltVendorSpecific)
 
-        # --- Step 3: Extended-supported-rates Tag (ID 50) → region hint ---
         tag50 = pkt.getlayer(Dot11Elt, ID=50)
         if tag50:
-            ch_list = list(tag50.info)
-            region = "TH/EU" if (12 in ch_list or 13 in ch_list) else "US/Global"
+            ch_list      = list(tag50.info)
+            region       = "TH/EU" if (12 in ch_list or 13 in ch_list) else "US/Global"
             if len(ch_list) > 11:
                 device_class = "High-End"
 
-    # --- Decision logic ---
     if is_apple:
         return f"Apple Device ({region})"
     if is_windows:
@@ -346,60 +521,224 @@ def _update_rssi_stats(session: Session, power: int) -> None:
     else:
         session.rssi_min = min(session.rssi_min, power)
         session.rssi_max = max(session.rssi_max, power)
-    session.rssi = power
+    session.rssi        = power
     session.rssi_total += power
     session.rssi_count += 1
+
+
+def _parse_set(value: str) -> set[str]:
+    """Parse semicolon/comma-separated evidence into a clean set."""
+    if not value:
+        return set()
+    normalized = value.replace(",", ";")
+    return {part.strip() for part in normalized.split(";") if part.strip()}
+
+
+def _sessions_overlap(left: Session, right_first_ts: float, right_last_ts: float) -> bool:
+    """Return True when two session windows overlap within the tolerance."""
+    return (
+        left.first_ts <= right_last_ts  + OVERLAP_TOLERANCE_SECONDS
+        and right_first_ts <= left.last_ts + OVERLAP_TOLERANCE_SECONDS
+    )
+
+
+def _time_gap_seconds(left: Session, right_first_ts: float, right_last_ts: float) -> float:
+    """Return the gap between two non-overlapping windows, or 0 when touching."""
+    if left.last_ts <= right_first_ts:
+        return right_first_ts - left.last_ts
+    if right_last_ts <= left.first_ts:
+        return left.first_ts - right_last_ts
+    return 0
+
+
+def _same_randomized_session_score(
+    session: Session,
+    power: int,
+    zone: str,
+    ssids: set[str],
+    frame_type: str,
+    ie_fingerprint: str,
+    vendor_ies: set[str],
+    now: float,
+) -> tuple[int, list[str]]:
+    """Score whether a randomized MAC observation belongs to a prior session."""
+    score   = 0
+    reasons: list[str] = []
+
+    if ie_fingerprint and session.ie_fingerprints:
+        if ie_fingerprint in session.ie_fingerprints:
+            score += 3
+            reasons.append("same IE fingerprint")
+        else:
+            score -= 3
+            reasons.append("different IE fingerprint")
+
+    if vendor_ies and session.vendor_ies:
+        if vendor_ies & session.vendor_ies:
+            score += 2
+            reasons.append("vendor IE overlap")
+        else:
+            score -= 1
+
+    if ssids and session.ssids:
+        if ssids & session.ssids:
+            score += 2
+            reasons.append("probe SSID overlap")
+        else:
+            score -= 1
+
+    if power and session.rssi:
+        rssi_delta = abs(session.rssi - power)
+        if rssi_delta <= 6:
+            score += 2
+            reasons.append("close RSSI")
+        elif rssi_delta <= 10:
+            score += 1
+            reasons.append("similar RSSI")
+        elif rssi_delta > 15:
+            score -= 1
+
+    if zone and zone != "unknown" and session.zone == zone:
+        score += 1
+        reasons.append("same zone")
+
+    if frame_type and frame_type in session.frame_types:
+        score += 1
+        reasons.append("frame type overlap")
+
+    gap = _time_gap_seconds(session, now, now)
+    if gap <= 120:
+        score += 1
+        reasons.append("nearby time window")
+    elif gap > 1800:
+        score -= 2
+
+    return score, reasons
+
+
+def _can_merge_randomized_session(
+    session: Session,
+    power: int,
+    zone: str,
+    ssids: set[str],
+    frame_type: str,
+    ie_fingerprint: str,
+    vendor_ies: set[str],
+    now: float,
+) -> tuple[bool, int, list[str]]:
+    """Apply the conservative randomized-session grouping rules."""
+    if _sessions_overlap(session, now, now):
+        return False, 0, ["overlapping randomized sessions"]
+
+    score, reasons = _same_randomized_session_score(
+        session, power, zone, ssids, frame_type, ie_fingerprint, vendor_ies, now
+    )
+    if score < GROUP_SCORE_THRESHOLD:
+        return False, score, reasons
+
+    supporting_reasons = {
+        "vendor IE overlap", "probe SSID overlap", "close RSSI",
+        "similar RSSI", "same zone", "frame type overlap", "nearby time window",
+    }
+    support_count = len(supporting_reasons & set(reasons))
+    return support_count >= 2, score, reasons
+
+
+def _update_session(
+    session: Session,
+    mac: str,
+    power: int,
+    zone: str,
+    ssids: set[str],
+    frame_type: str,
+    ie_fingerprint: str,
+    vendor_ies: set[str],
+    now: float,
+) -> None:
+    """Merge one observation into an existing session."""
+    session.last_mac = mac
+    _update_rssi_stats(session, power)
+    if zone != "unknown":
+        session.zone = zone
+    session.last_ts = now
+    session.all_macs.add(mac)
+    session.ssids.update(ssids)
+    session.frame_types.add(frame_type)
+    if ie_fingerprint:
+        session.ie_fingerprints.add(ie_fingerprint)
+    session.vendor_ies.update(vendor_ies)
 
 
 def track_session(
     mac: str,
     identity: str,
     power: int,
+    zone: str,
     ssids: list[str],
     frame_type: str,
     ie_fingerprint: str,
     vendor_ies: str,
+    mac_type: str,
 ) -> str:
     """
     Match this observation to an existing session or create a new one.
     Returns a label like 'New-User-3' or 'Existing-User-1'.
     """
-    now = time.time()
-    # Strip OUI noise for fingerprint comparison
-    fingerprint = identity.split("[OUI:")[0].strip()
+    now            = time.time()
+    fingerprint    = identity.split("[OUI:")[0].strip()
+    ssid_set       = {ssid for ssid in ssids if ssid}
+    vendor_ie_set  = _parse_set(vendor_ies)
 
     with _session_lock:
         _expire_sessions(now)
 
-        # Try to match by identity + RSSI proximity (±12 dBm).
-        # IE fingerprints are logged as evidence, not used alone as identity.
         for sid, session in active_sessions.items():
-            if (session.fingerprint == fingerprint
-                    and abs(session.rssi - power) <= 12):
-                session.last_mac = mac
-                _update_rssi_stats(session, power)
-                session.last_ts = now
-                session.all_macs.add(mac)
-                session.ssids.update(ssids)
-                session.frame_types.add(frame_type)
-                if ie_fingerprint:
-                    session.ie_fingerprints.add(ie_fingerprint)
-                if vendor_ies:
-                    session.vendor_ies.update(vendor_ies.split(";"))
+            if mac in session.all_macs:
+                _update_session(
+                    session, mac, power, zone, ssid_set, frame_type,
+                    ie_fingerprint, vendor_ie_set, now
+                )
                 return f"Existing-User-{sid}"
 
-        # No match → new session
-        new_id = max(active_sessions.keys(), default=0) + 1
+        if mac_type == "Randomized":
+            best_sid    = None
+            best_score  = -99
+            best_reasons: list[str] = []
+            for sid, session in active_sessions.items():
+                if session.mac_type != "Randomized":
+                    continue
+                allowed, score, reasons = _can_merge_randomized_session(
+                    session, power, zone, ssid_set, frame_type,
+                    ie_fingerprint, vendor_ie_set, now
+                )
+                if allowed and score > best_score:
+                    best_sid     = sid
+                    best_score   = score
+                    best_reasons = reasons
+
+            if best_sid is not None:
+                session     = active_sessions[best_sid]
+                _update_session(
+                    session, mac, power, zone, ssid_set, frame_type,
+                    ie_fingerprint, vendor_ie_set, now
+                )
+                reason_text = ", ".join(best_reasons) if best_reasons else "matched evidence"
+                log.debug("Merged randomized MAC %s into User-%s: %s", mac, best_sid, reason_text)
+                return f"Existing-User-{best_sid}"
+
+        new_id  = max(active_sessions.keys(), default=0) + 1
         session = Session(
-            last_mac=mac,
-            all_macs={mac},
-            fingerprint=fingerprint,
-            ie_fingerprints={ie_fingerprint} if ie_fingerprint else set(),
-            vendor_ies=set(vendor_ies.split(";")) if vendor_ies else set(),
-            frame_types={frame_type},
-            ssids=set(ssids),
-            first_ts=now,
-            last_ts=now,
+            last_mac        = mac,
+            all_macs        = {mac},
+            fingerprint     = fingerprint,
+            ie_fingerprints = {ie_fingerprint} if ie_fingerprint else set(),
+            vendor_ies      = vendor_ie_set,
+            mac_type        = mac_type,
+            frame_types     = {frame_type},
+            ssids           = ssid_set,
+            zone            = zone,
+            first_ts        = now,
+            last_ts         = now,
         )
         _update_rssi_stats(session, power)
         active_sessions[new_id] = session
@@ -412,7 +751,7 @@ def track_session(
 
 def generate_session_report() -> None:
     """Write a human-friendly daily summary CSV of active sessions."""
-    report_file = f"{SUMMARY_PREFIX}_{time.strftime('%Y%m%d')}.csv"
+    report_file = os.path.join(SUMMARY_DIR, f"{SUMMARY_PREFIX}_{time.strftime('%Y%m%d')}.csv")
     with _session_lock:
         rows = list(active_sessions.items())
 
@@ -429,7 +768,7 @@ def generate_session_report() -> None:
                 round(s.rssi_total / s.rssi_count, 1)
                 if s.rssi_count else 0
             )
-            clean_id = s.fingerprint.split("(")[0].strip()
+            clean_id  = s.fingerprint.split("(")[0].strip()
             ssid_list = list(s.ssids)
             top_ssid  = ssid_list[0] if ssid_list else "-"
             if len(ssid_list) > 1:
@@ -476,43 +815,50 @@ def _freq_to_band(freq: int) -> str:
 
 def _pick_colour(identity: str) -> str:
     """Return ANSI colour code based on the identified device type."""
-    if "Apple" in identity:
-        return COLOUR_RED
-    if "Samsung" in identity:
-        return COLOUR_BLUE
-    if "Unknown" in identity:
-        return COLOUR_GREY
+    if "Apple"   in identity: return COLOUR_RED
+    if "Samsung" in identity: return COLOUR_BLUE
+    if "Unknown" in identity: return COLOUR_GREY
     return COLOUR_YELLOW
+
+
+def classify_frame(pkt) -> tuple[str | None, str]:
+    """
+    Identify a supported 802.11 management frame and its source MAC.
+
+    Catches the association family in full, including the rarely-captured
+    association/reassociation *response* frames the AP sends back to a client
+    (ASSOC_RESP / REASSOC_RESP) — these only appear during the brief connection
+    handshake, so they seldom show up in a passive capture. Returns
+    ``(pkt_type, mac_addr)`` or ``(None, "")`` for frames we don't track.
+
+    Ordered so the more specific *response* checks run before the request
+    layers they subclass, avoiding misclassification.
+    """
+    if pkt.haslayer(Dot11Beacon):
+        return "BEACON", _safe_upper_mac(pkt.addr3)
+    if pkt.haslayer(Dot11ProbeReq):
+        return "PROBE", _safe_upper_mac(pkt.addr2)
+    if pkt.haslayer(Dot11AssoResp):
+        return "ASSOC_RESP", _safe_upper_mac(pkt.addr2)
+    if pkt.haslayer(Dot11AssoReq):
+        return "ASSOC_REQ", _safe_upper_mac(pkt.addr2)
+    if pkt.haslayer(Dot11ReassoResp):
+        return "REASSOC_RESP", _safe_upper_mac(pkt.addr2)
+    if pkt.haslayer(Dot11ReassoReq):
+        return "REASSOC_REQ", _safe_upper_mac(pkt.addr2)
+    if pkt.haslayer(Dot11Auth):
+        return "AUTH", _safe_upper_mac(pkt.addr2)
+    if pkt.haslayer(Dot11Deauth):
+        return "DEAUTH", _safe_upper_mac(pkt.addr2)
+    if pkt.haslayer(Dot11Disas):
+        return "DISASSOC", _safe_upper_mac(pkt.addr2)
+    return None, ""
 
 
 def handle_packet(pkt) -> None:
     """Process each captured 802.11 frame."""
-    # --- Classify frame type ---
-    if pkt.haslayer(Dot11Beacon):
-        pkt_type = "BEACON"
-        mac_addr = _safe_upper_mac(pkt.addr3)
-    elif pkt.haslayer(Dot11ProbeReq):
-        pkt_type = "PROBE"
-        mac_addr = _safe_upper_mac(pkt.addr2)
-    elif pkt.haslayer(Dot11AssoReq):
-        pkt_type = "ASSOC_REQ"
-        mac_addr = _safe_upper_mac(pkt.addr2)
-    elif pkt.haslayer(Dot11ReassoReq):
-        pkt_type = "REASSOC_REQ"
-        mac_addr = _safe_upper_mac(pkt.addr2)
-    elif pkt.haslayer(Dot11Auth):
-        pkt_type = "AUTH"
-        mac_addr = _safe_upper_mac(pkt.addr2)
-    elif pkt.haslayer(Dot11Deauth):
-        pkt_type = "DEAUTH"
-        mac_addr = _safe_upper_mac(pkt.addr2)
-    elif pkt.haslayer(Dot11Disas):
-        pkt_type = "DISASSOC"
-        mac_addr = _safe_upper_mac(pkt.addr2)
-    else:
-        return
-
-    if not mac_addr:
+    pkt_type, mac_addr = classify_frame(pkt)
+    if pkt_type is None or not mac_addr:
         return
 
     ssid = extract_ssid(
@@ -520,20 +866,19 @@ def handle_packet(pkt) -> None:
         "(Hidden SSID)" if pkt_type == "BEACON" else "(Wildcard)",
     )
 
-    # --- Radio metadata ---
-    power: int = 0
-    channel: int | str = "N/A"
-    band = "N/A"
+    power: int   = 0
+    channel      = "N/A"
+    band         = "N/A"
     if pkt.haslayer(RadioTap):
-        rtap = pkt.getlayer(RadioTap)
-        power = getattr(rtap, "dBm_AntSignal", 0) or 0
+        rtap    = pkt.getlayer(RadioTap)
+        power   = getattr(rtap, "dBm_AntSignal", 0) or 0
         if hasattr(rtap, "Channel"):
             channel = _freq_to_channel(rtap.Channel)
-            band = _freq_to_band(rtap.Channel)
+            band    = _freq_to_band(rtap.Channel)
 
-    # --- Derived fields ---
     timestamp    = time.strftime("%Y-%m-%d %H:%M:%S")
     dist_m       = calculate_distance(power)
+    zone         = proximity_zone(dist_m)
     mac_type     = check_mac_type(mac_addr)
     vendor       = get_vendor(mac_addr, mac_type)
     now          = time.time()
@@ -544,15 +889,15 @@ def handle_packet(pkt) -> None:
     ie_details   = extract_ie_details(pkt)
     if pkt_type in CLIENT_FRAME_TYPES:
         session_note = track_session(
-            mac_addr, identity, power, [ssid], pkt_type,
-            ie_details["ie_fingerprint"], ie_details["vendor_ies"],
+            mac_addr, identity, power, zone, [ssid], pkt_type,
+            ie_details["ie_fingerprint"], ie_details["vendor_ies"], mac_type,
         )
     else:
         session_note = "AP-Logged-Only"
-    final_note   = f"{session_note} | {identity}"
-    colour       = _pick_colour(identity)
 
-    # --- Terminal output (clients only) ---
+    final_note = f"{session_note} | {identity}"
+    colour     = _pick_colour(identity)
+
     if pkt_type in CLIENT_FRAME_TYPES:
         print(
             f"{colour}[C] {timestamp} | {pkt_type:<11} | {mac_addr} | "
@@ -560,7 +905,6 @@ def handle_packet(pkt) -> None:
             f"SSID: {ssid:<20} | {identity}{COLOUR_RESET}"
         )
 
-    # --- CSV logging ---
     _append_csv_row([
         timestamp, pkt_type, mac_addr, mac_type,
         vendor, ssid, channel, band, power, dist_m,
@@ -569,6 +913,8 @@ def handle_packet(pkt) -> None:
         final_note,
     ])
 
+    dump_ie_details(pkt, timestamp, pkt_type, mac_addr)
+
 
 # ---------------------------------------------------------------------------
 # Background threads
@@ -576,11 +922,19 @@ def handle_packet(pkt) -> None:
 
 def channel_hopper() -> None:
     """Rotate through channels 1–13 continuously."""
-    log.info(f"Channel hopper started on {INTERFACE}")
+    log.info("Channel hopper started on %s", INTERFACE)
     while True:
         for ch in range(1, 14):
-            os.system(f"iw dev {INTERFACE} set channel {ch} 2>/dev/null")
-            time.sleep(0.5)
+            result = subprocess.run(
+                ["iw", "dev", INTERFACE, "set", "channel", str(ch)],
+                check=False,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            if result.returncode != 0:
+                log.warning("Channel hop to %s failed: %s", ch, result.stderr.strip())
+            time.sleep(CHANNEL_HOP_INTERVAL)
 
 
 def auto_report_worker() -> None:
@@ -588,7 +942,7 @@ def auto_report_worker() -> None:
     while True:
         time.sleep(AUTO_SAVE_INTERVAL)
         generate_session_report()
-        log.info(f"Auto-saved session summary ({time.strftime('%H:%M:%S')})")
+        log.info("Auto-saved session summary (%s)", time.strftime("%H:%M:%S"))
 
 
 # ---------------------------------------------------------------------------
@@ -596,10 +950,21 @@ def auto_report_worker() -> None:
 # ---------------------------------------------------------------------------
 
 def main() -> None:
-    setup_csv()
+    parser = argparse.ArgumentParser(description="Passive Wi-Fi reconnaissance capture.")
+    parser.add_argument(
+        "--hop",
+        action="store_true",
+        help="Enable active channel hopping with iw. Disabled by default.",
+    )
+    args = parser.parse_args()
 
-    log.info(f"Starting WiFi Recon on interface: {INTERFACE}")
-    log.info(f"Logging packets to: {LOG_FILE}")
+    setup_csv()
+    setup_ie_csv()
+
+    log.info("Starting WiFi Recon on interface: %s", INTERFACE)
+    log.info("Logging packets to            : %s", LOG_FILE)
+    log.info("Logging IE breakdown to       : %s", IE_DETAILS_FILE)
+    log.info("Max reconnect attempts        : %d", MAX_RETRIES)
 
     sep = "-" * 110
     print(sep)
@@ -607,14 +972,56 @@ def main() -> None:
           f"{'Pwr':>4} | {'Dist':>5} | SSID")
     print(sep)
 
-    threading.Thread(target=channel_hopper,    daemon=True).start()
+    if args.hop:
+        threading.Thread(target=channel_hopper, daemon=True).start()
+    else:
+        log.info("Channel hopping disabled — use --hop to rotate channels.")
     threading.Thread(target=auto_report_worker, daemon=True).start()
 
+    # ── Capture loop with automatic interface recovery ────────────────────────
+    # sniff() exits silently (returns normally without raising) when the adapter
+    # drops out of monitor mode — the same "Network is down" scenario we handle
+    # in wifi_sniffer.py. The outer while loop detects this and calls
+    # reset_monitor_mode() before trying again, up to MAX_RETRIES times.
+    # A clean Ctrl+C raises KeyboardInterrupt which breaks out of the loop
+    # immediately into the final report save below.
+    retry_count = 0
     try:
-        sniff(iface=INTERFACE, prn=handle_packet, store=False)
+        while True:
+            try:
+                sniff(iface=INTERFACE, prn=handle_packet, store=False)
+
+                # sniff() returned without an exception — adapter likely dropped.
+                retry_count += 1
+                if retry_count > MAX_RETRIES:
+                    log.error("Gave up after %d reconnect attempts.", MAX_RETRIES)
+                    break
+
+                log.warning(
+                    "Capture socket closed unexpectedly. "
+                    "Reconnect attempt %d/%d in %ds …",
+                    retry_count, MAX_RETRIES, RETRY_DELAY,
+                )
+                time.sleep(RETRY_DELAY)
+                reset_monitor_mode(INTERFACE)
+
+            except OSError as exc:
+                # Some adapter failures raise here instead of returning silently.
+                retry_count += 1
+                if retry_count > MAX_RETRIES:
+                    log.error("Gave up after %d reconnect attempts: %s", MAX_RETRIES, exc)
+                    break
+                log.warning(
+                    "Socket error: %s — reconnect attempt %d/%d in %ds …",
+                    exc, retry_count, MAX_RETRIES, RETRY_DELAY,
+                )
+                time.sleep(RETRY_DELAY)
+                reset_monitor_mode(INTERFACE)
+
     except KeyboardInterrupt:
         log.info("Interrupted – saving final session report …")
-        generate_session_report()
+
+    generate_session_report()
 
 
 if __name__ == "__main__":

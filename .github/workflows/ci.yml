@@ -35,7 +35,7 @@ jobs:
       - name: Run unit tests
         env:
           PYTHONPATH: src
-        run: python -m unittest discover -s tests
+        run: python -m unittest discover -s tests -p "*.py"
 
       - name: Validate shell scripts
         run: bash -n scripts/*.sh

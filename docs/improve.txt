@@ -1,0 +1,39 @@
+สิ่งที่ V3 improve จาก V2 หลัก ๆ
+
+จับ packet ได้หลายประเภทขึ้น
+V2 จับหลัก ๆ แค่ Beacon กับ Probe Request
+แต่ V3 เพิ่ม ASSOC_REQ, REASSOC_REQ, AUTH, DEAUTH, DISASSOC ทำให้เห็นพฤติกรรม client ตอนเชื่อมต่อ/ตัดการเชื่อมต่อได้มากขึ้น
+Fingerprint ละเอียดขึ้น
+V2 ใช้ vendor/OUI + RSSI เป็นหลักในการเดา device/session
+V3 เพิ่มการอ่าน 802.11 Information Elements เช่น IE sequence, IE fingerprint, Vendor IE, capabilities เช่น HT, VHT, RSN, WPS ทำให้แยกอุปกรณ์ได้ดีขึ้น
+
+จัดกลุ่ม Randomized MAC ดีขึ้น
+V2 ใช้วิธีจับคู่จาก fingerprint + RSSI ใกล้กัน
+V3 มี scoring system เช่น
+
+IE fingerprint เหมือนกัน
+Vendor IE overlap
+SSID overlap
+RSSI ใกล้กัน
+อยู่ zone เดียวกัน
+เวลาใกล้กัน
+
+ทำให้มีโอกาสรู้ว่า MAC random หลายตัวอาจมาจากเครื่องเดียวกันได้แม่นกว่าเดิม
+
+เพิ่ม Band และ Channel รองรับ 5GHz / 6GHz
+V2 แปลง channel ได้แค่ 2.4GHz เป็นหลัก
+V3 เพิ่ม _freq_to_band() และรองรับ band เช่น 2.4GHz, 5GHz, 6GHz ทำให้ report ชัดขึ้นว่า packet มาจากย่านไหน
+Session report ดีขึ้น
+V2 summary มีข้อมูลพื้นฐาน เช่น Time In/Out, Stay mins, Device Type, MAC Count, Top SSID
+V3 เพิ่มข้อมูลเช่น full timestamp, frame types, IE fingerprints, Vendor IEs, RSSI min/max/avg ทำให้เอาไปวิเคราะห์ต่อใน ELK/SIEM ได้ดีกว่า
+ปลอดภัย/ควบคุมง่ายขึ้นตอน channel hopping
+V2 เปิด channel hopping อัตโนมัติ
+V3 เปลี่ยนเป็นต้องใส่ --hop ก่อน ถึงจะ hop channel ทำให้ไม่ไปเปลี่ยน channel เองโดยไม่ตั้งใจ และใช้ subprocess.run() แทน os.system() ซึ่งควบคุม error ได้ดีกว่า
+CSV มี field มากขึ้น
+V3 เพิ่ม column เช่น Band, IE_Sequence, IE_Fingerprint, Vendor_IEs, Capabilities ทำให้ข้อมูล output ใช้ทำ dashboard หรือ correlation ได้ละเอียดกว่า V2
+
+สรุปสั้น ๆ:
+V2 = passive sniffer พื้นฐาน + vendor/device guess + session tracking แบบง่าย
+V3 = version ที่จริงจังกว่า เพราะเพิ่ม packet types, IE fingerprinting, randomized MAC correlation, RSSI stats, band detection และ report ที่ละเอียดขึ้น
+
+พูดง่าย ๆ คือ V3 ไม่ได้แค่เห็นว่า “มีเครื่องนี้อยู่” แต่พยายามเข้าใจว่า “เครื่องนี้อาจเป็น user เดิม แม้ MAC จะเปลี่ยน” ได้ดีขึ้น.

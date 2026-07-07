@@ -24,7 +24,7 @@ maichai
 .DS_Store
 Thumbs.db
 
-#Secret
+# Secret
 .env.*
 *.key
 *.pem
@@ -34,3 +34,6 @@ secrets/
 config.local.*
 __pycache__/
 *.log
+
+# Explaination
+explanation/

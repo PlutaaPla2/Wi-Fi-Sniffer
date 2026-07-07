@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Wi-Fi Sniffer v0.7 Explained</title>
+  <title>Wi-Fi Sniffer Explained</title>
   <style>
     :root {
       color-scheme: light;
@@ -113,6 +113,33 @@
       margin-top: 1rem;
     }
 
+    .tab-list,
+    .language-switch {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 0.4rem;
+      margin: 1rem 0;
+    }
+
+    .tab-button,
+    .language-button {
+      min-height: 2.35rem;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: #ffffff;
+      color: #324052;
+      font: inherit;
+      font-weight: 700;
+      cursor: pointer;
+    }
+
+    .tab-button[aria-selected="true"],
+    .language-button[aria-pressed="true"] {
+      border-color: var(--accent);
+      background: var(--accent);
+      color: #ffffff;
+    }
+
     .nav a {
       display: block;
       padding: 0.42rem 0.5rem;
@@ -130,6 +157,24 @@
     .content {
       min-width: 0;
       background: var(--paper);
+    }
+
+    .tab-panel[hidden],
+    .language-panel[hidden],
+    .nav[hidden] {
+      display: none;
+    }
+
+    .language-tools {
+      padding: 1.25rem clamp(1rem, 5vw, 5rem);
+      border-bottom: 1px solid var(--line);
+      background: #f8fafc;
+    }
+
+    .language-tools p {
+      max-width: 82ch;
+      margin: 0.5rem 0 0;
+      color: var(--muted);
     }
 
     .hero {
@@ -502,10 +547,14 @@
   <div class="page">
     <aside class="side">
       <div class="brand">
-        <h1>Wi-Fi Sniffer v0.7</h1>
-        <p>A readable walkthrough of <code>test_sniffer_v0_7.py</code>.</p>
+        <h1>Wi-Fi Sniffer</h1>
+        <p>Readable walkthroughs of <code>test_sniffer_v0_7.py</code> and <code>night_sniffer_v3.py</code>.</p>
       </div>
-      <nav class="nav" aria-label="Page sections">
+      <div class="tab-list" role="tablist" aria-label="Documentation tabs">
+        <button class="tab-button" type="button" role="tab" id="tab-wifi" aria-controls="panel-wifi" aria-selected="true" data-tab-target="wifi">Wi-Fi Sniffer</button>
+        <button class="tab-button" type="button" role="tab" id="tab-night" aria-controls="panel-night" aria-selected="false" data-tab-target="night">Night v3</button>
+      </div>
+      <nav class="nav" aria-label="Wi-Fi Sniffer sections" data-nav="wifi">
         <a href="#overview">Overview</a>
         <a href="#how-to-run">How To Run</a>
         <a href="#big-picture">Big Picture Flow</a>
@@ -521,9 +570,17 @@
         <a href="#examples">Examples</a>
         <a href="#limits">Limits</a>
       </nav>
+      <nav class="nav" aria-label="Night v3 sections" data-nav="night" hidden>
+        <a href="#v3-overview">Night v3 Overview</a>
+        <a href="#v3-flow">Night v3 Packet Flow</a>
+        <a href="#v3-sessions">Night v3 Sessions</a>
+        <a href="#v3-functions">Night v3 Function Map</a>
+        <a href="#v3-th-overview">Thai Explanation</a>
+      </nav>
     </aside>
 
     <main class="content">
+      <div class="tab-panel" id="panel-wifi" role="tabpanel" aria-labelledby="tab-wifi" data-tab-panel="wifi">
       <header class="hero">
         <div>
           <h2>Passive Wi-Fi Sniffer Explained</h2>
@@ -532,7 +589,9 @@
             frames, remembers each device by MAC address, estimates rough
             distance from signal strength, detects randomized MAC addresses,
             fingerprints packet Information Elements, prints a summary, and
-            exports a CSV file.
+            exports CSV files. The later <code>night_sniffer_v3.py</code>
+            version adds session grouping so randomized MAC addresses are less
+            likely to inflate room occupancy counts.
           </p>
           <ul class="hero-list">
             <li><span class="dot">1</span><span>The script does not connect to networks. It listens passively in monitor mode.</span></li>
@@ -1236,7 +1295,596 @@ Interpretation:
           order follows the data flow from one packet to the final CSV.
         </p>
       </section>
+      </div>
+
+      <div class="tab-panel" id="panel-night" role="tabpanel" aria-labelledby="tab-night" data-tab-panel="night" hidden>
+      <div class="language-tools">
+        <div class="language-switch" aria-label="Night v3 language">
+          <button class="language-button" type="button" aria-pressed="true" data-lang-target="en">English</button>
+          <button class="language-button" type="button" aria-pressed="false" data-lang-target="th">ไทย</button>
+        </div>
+        <p>Use the language buttons to switch only the Night v3 explanation. The Wi-Fi Sniffer tab stays in English.</p>
+      </div>
+
+      <div class="language-panel" data-lang-panel="en">
+
+      <section id="v3-overview">
+        <h2>Night Sniffer v3 Overview</h2>
+        <p class="lede">
+          <code>src/night_sniffer_v3.py</code> is the room-occupancy version of
+          the sniffer. It still listens passively, but it is more focused on
+          answering one practical question: how many nearby client devices look
+          like real room occupants right now?
+        </p>
+        <div class="grid three">
+          <article class="card">
+            <h3>What Changed</h3>
+            <p>
+              v0.7 mostly records one row per MAC address. v3 records every
+              useful frame to <code>wifi_full_recon_report.csv</code> and also
+              keeps active <code>Session</code> objects in memory.
+            </p>
+          </article>
+          <article class="card">
+            <h3>Why Sessions Matter</h3>
+            <p>
+              Phones often use randomized MAC addresses. v3 tries to group
+              strong evidence from changed randomized MACs into one user session
+              instead of counting every temporary MAC as a new person.
+            </p>
+          </article>
+          <article class="card">
+            <h3>What It Exports</h3>
+            <p>
+              The main CSV stores packet-level evidence. A daily summary file,
+              such as <code>daily_summary_20260625.csv</code>, stores one row
+              per active session.
+            </p>
+          </article>
+        </div>
+        <h3>Important Beginner Terms</h3>
+        <table>
+          <thead>
+            <tr>
+              <th>Term</th>
+              <th>Beginner Meaning</th>
+              <th>Where v3 Uses It</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><code>Probe Request</code></td>
+              <td>A phone or laptop asking what Wi-Fi networks are nearby.</td>
+              <td>Client activity, occupancy signal, SSID evidence.</td>
+            </tr>
+            <tr>
+              <td><code>Beacon</code></td>
+              <td>A router announcing that an access point exists.</td>
+              <td>Logged for recon, but not counted as a room user session.</td>
+            </tr>
+            <tr>
+              <td><code>RSSI</code></td>
+              <td>Signal strength. Less negative is stronger: <code>-45</code> is closer than <code>-80</code>.</td>
+              <td>Distance estimate, proximity zone, randomized-MAC grouping.</td>
+            </tr>
+            <tr>
+              <td><code>IE</code></td>
+              <td>Information Element: small tagged data inside Wi-Fi management frames.</td>
+              <td>Fingerprinting, vendor clues, capability clues.</td>
+            </tr>
+            <tr>
+              <td><code>Randomized MAC</code></td>
+              <td>A temporary address made by the device OS to protect privacy.</td>
+              <td>Special grouping logic in <code>track_session()</code>.</td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+
+      <section id="v3-flow">
+        <h2>Night v3 Packet Flow</h2>
+        <p>
+          In v3, almost all live packet work happens in
+          <code>handle_packet(pkt)</code>. Think of it as a factory line: each
+          packet enters, gets classified, gets useful fields extracted, then is
+          logged and possibly attached to a session.
+        </p>
+        <ol class="flow">
+          <li>
+            <div>
+              <strong>Classify the frame</strong>
+              <span>The handler checks Scapy layers such as <code>Dot11ProbeReq</code>, <code>Dot11Beacon</code>, <code>Dot11AssoReq</code>, <code>Dot11Auth</code>, and <code>Dot11Deauth</code>.</span>
+            </div>
+          </li>
+          <li>
+            <div>
+              <strong>Choose the MAC address</strong>
+              <span>Client frames use <code>addr2</code>, the transmitter. Beacon frames use <code>addr3</code>, the access point BSSID.</span>
+            </div>
+          </li>
+          <li>
+            <div>
+              <strong>Read radio metadata</strong>
+              <span>If <code>RadioTap</code> exists, v3 reads <code>dBm_AntSignal</code> for RSSI and converts frequency into channel and band.</span>
+            </div>
+          </li>
+          <li>
+            <div>
+              <strong>Estimate proximity</strong>
+              <span><code>calculate_distance()</code> converts RSSI to metres, then <code>proximity_zone()</code> labels it as <code>immediate</code>, <code>near</code>, <code>mid</code>, or <code>far</code>.</span>
+            </div>
+          </li>
+          <li>
+            <div>
+              <strong>Extract fingerprints</strong>
+              <span><code>extract_ie_details()</code> walks raw IE bytes and produces an IE sequence, short SHA-1 fingerprint, vendor IE OUIs, and capability labels.</span>
+            </div>
+          </li>
+          <li>
+            <div>
+              <strong>Update session and logs</strong>
+              <span>Client frames call <code>track_session()</code>. Every accepted frame is appended to the main CSV by <code>_append_csv_row()</code>.</span>
+            </div>
+          </li>
+        </ol>
+        <h3>Simple Example</h3>
+        <pre><code>Phone sends Probe Request
+  source MAC: 02:11:22:33:44:55
+  RSSI: -53 dBm
+  SSID: Office
+  IE fingerprint: abc123
+
+v3 result
+  MAC type: Randomized
+  distance: about 4 metres
+  zone: near
+  session note: New-User-1
+  CSV row: packet evidence is saved</code></pre>
+      </section>
+
+      <section id="v3-sessions">
+        <h2>Night v3 Session Logic</h2>
+        <p>
+          The most important v3 idea is the <code>Session</code> dataclass. A
+          session is not one packet. It is the script's current best guess that
+          several observations belong to one nearby device/user.
+        </p>
+        <pre><code>Session(
+  last_mac="02:11:22:33:44:55",
+  all_macs={"02:11:22:33:44:55"},
+  ie_fingerprints={"abc123"},
+  vendor_ies={"00:17:f2"},
+  ssids={"Office"},
+  frame_types={"PROBE"},
+  first_ts=..., last_ts=...,
+  rssi_min=-57, rssi_max=-50, rssi_total=-210, rssi_count=4
+)</code></pre>
+        <h3>Same MAC Is Easy</h3>
+        <p>
+          If a later packet has a MAC address already inside
+          <code>session.all_macs</code>, v3 updates that session immediately.
+          This avoids double-counting repeated packets from the same address.
+        </p>
+        <h3>Real MACs Are Kept Separate</h3>
+        <p>
+          If <code>check_mac_type()</code> says a MAC is <code>Real</code>, v3
+          does not merge it with other real MACs just because RSSI or identity
+          looks similar. Real manufacturer MACs are stable enough that merging
+          them would risk under-counting two separate people.
+        </p>
+        <h3>Randomized MACs Need Evidence</h3>
+        <p>
+          Randomized MACs can change, so v3 scores whether a new randomized MAC
+          looks like an older randomized session. <code>_same_randomized_session_score()</code>
+          adds or subtracts points from evidence:
+        </p>
+        <table>
+          <thead>
+            <tr>
+              <th>Evidence</th>
+              <th>Why It Helps</th>
+              <th>Score Effect</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Same IE fingerprint</td>
+              <td>The packets have the same stable IE pattern.</td>
+              <td><code>+3</code></td>
+            </tr>
+            <tr>
+              <td>Vendor IE overlap</td>
+              <td>The same vendor-specific Wi-Fi extension appears.</td>
+              <td><code>+2</code></td>
+            </tr>
+            <tr>
+              <td>Probe SSID overlap</td>
+              <td>Both MACs asked for the same network name.</td>
+              <td><code>+2</code></td>
+            </tr>
+            <tr>
+              <td>Close or similar RSSI</td>
+              <td>The signal strength suggests a similar location.</td>
+              <td><code>+2</code> or <code>+1</code></td>
+            </tr>
+            <tr>
+              <td>Same zone, same frame type, nearby time</td>
+              <td>Small supporting clues that make a match more believable.</td>
+              <td><code>+1</code> each</td>
+            </tr>
+          </tbody>
+        </table>
+        <div class="example warning">
+          v3 is conservative. <code>_can_merge_randomized_session()</code>
+          rejects overlapping sessions, requires a score of at least
+          <code>GROUP_SCORE_THRESHOLD</code>, and still requires at least two
+          supporting reasons. This helps avoid merging two real people into one
+          count.
+        </div>
+      </section>
+
+      <section id="v3-functions">
+        <h2>Night v3 Function Map</h2>
+        <table>
+          <thead>
+            <tr>
+              <th>Function or Constant</th>
+              <th>Role</th>
+              <th>Beginner Reading Tip</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><code>CSV_FIELDS</code></td>
+              <td>Defines the main packet log columns.</td>
+              <td>Read this first to understand what evidence v3 saves.</td>
+            </tr>
+            <tr>
+              <td><code>Session</code></td>
+              <td>Stores one active user/device session.</td>
+              <td>This is the memory used for occupancy counting.</td>
+            </tr>
+            <tr>
+              <td><code>calculate_distance()</code></td>
+              <td>Converts RSSI to rough metres.</td>
+              <td>Useful for proximity only, not exact location.</td>
+            </tr>
+            <tr>
+              <td><code>check_mac_type()</code></td>
+              <td>Detects randomized MACs from the locally administered bit.</td>
+              <td><code>02:...</code> and <code>06:...</code> are common randomized-looking starts.</td>
+            </tr>
+            <tr>
+              <td><code>extract_ie_details()</code></td>
+              <td>Builds IE sequence, fingerprint, vendor IE list, and capability list.</td>
+              <td>This is the main fingerprinting function.</td>
+            </tr>
+            <tr>
+              <td><code>get_correlation_identity()</code></td>
+              <td>Creates a readable identity such as Apple Device or Windows/PC.</td>
+              <td>This is a hint, not a guaranteed device model.</td>
+            </tr>
+            <tr>
+              <td><code>track_session()</code></td>
+              <td>Creates, updates, or merges user sessions.</td>
+              <td>This is the core anti-double-counting function.</td>
+            </tr>
+            <tr>
+              <td><code>generate_session_report()</code></td>
+              <td>Writes the daily summary CSV from active sessions.</td>
+              <td>This is the file to inspect for occupancy-style results.</td>
+            </tr>
+            <tr>
+              <td><code>handle_packet()</code></td>
+              <td>Classifies packets, extracts fields, calls session logic, writes CSV.</td>
+              <td>Read this after the helper functions.</td>
+            </tr>
+            <tr>
+              <td><code>channel_hopper()</code></td>
+              <td>Optionally rotates channels 1 through 13 using <code>iw</code>.</td>
+              <td>Only runs when <code>--hop</code> is passed.</td>
+            </tr>
+            <tr>
+              <td><code>main()</code></td>
+              <td>Sets up CSV, starts background reporting, then calls Scapy <code>sniff()</code>.</td>
+              <td>This is the program entry point.</td>
+            </tr>
+          </tbody>
+        </table>
+        <h3>Recommended Reading Order</h3>
+        <p>
+          For <code>night_sniffer_v3.py</code>, read in this order:
+          constants, <code>Session</code>, simple helpers, IE extraction,
+          session scoring, <code>handle_packet()</code>, reporting, then
+          <code>main()</code>. That follows how one packet becomes one CSV row
+          and possibly one active room-occupancy session.
+        </p>
+      </section>
+      </div>
+
+      <div class="language-panel" data-lang-panel="th" hidden lang="th">
+      <section id="v3-th-overview">
+        <h2>อธิบาย Night Sniffer v3</h2>
+        <p class="lede">
+          <code>src/night_sniffer_v3.py</code> คือเวอร์ชันที่เน้นการนับจำนวนคนในห้องจากสัญญาณ Wi-Fi แบบ passive.
+          โปรแกรมไม่ได้เชื่อมต่อ Wi-Fi และไม่ได้ถอดรหัสข้อมูลผู้ใช้ แต่ฟัง packet ที่ลอยอยู่ในอากาศ แล้วใช้หลักฐานหลายอย่างเพื่อเดาว่าอุปกรณ์ไหนน่าจะอยู่ใกล้และควรถูกนับเป็นคนในห้อง
+        </p>
+        <div class="grid three">
+          <article class="card">
+            <h3>ต่างจากเวอร์ชันเก่าอย่างไร</h3>
+            <p>
+              เวอร์ชัน v0.7 จะเก็บข้อมูลหลัก ๆ ตาม MAC address หนึ่งตัวต่อหนึ่ง record.
+              แต่ Night v3 เก็บหลักฐานระดับ packet ลง <code>wifi_full_recon_report.csv</code>
+              และยังสร้าง <code>Session</code> เพื่อจำว่า packet หลายตัวอาจมาจากอุปกรณ์เดิม
+            </p>
+          </article>
+          <article class="card">
+            <h3>ทำไมต้องมี Session</h3>
+            <p>
+              โทรศัพท์หลายเครื่องใช้ randomized MAC เพื่อความเป็นส่วนตัว ทำให้ MAC เปลี่ยนได้.
+              ถ้านับทุก MAC ตรง ๆ จำนวนคนอาจสูงเกินจริง. Night v3 จึงพยายามรวม MAC สุ่มที่มีหลักฐานว่าเป็นเครื่องเดิมให้เป็น session เดียว
+            </p>
+          </article>
+          <article class="card">
+            <h3>ผลลัพธ์ที่ได้</h3>
+            <p>
+              CSV หลักเก็บหลักฐานของแต่ละ packet. ไฟล์ summary รายวัน เช่น
+              <code>daily_summary_20260625.csv</code> เก็บข้อมูลหนึ่งแถวต่อหนึ่ง session
+              เพื่อใช้ดูแนวโน้มจำนวนคนในห้อง
+            </p>
+          </article>
+        </div>
+        <h3>คำสำคัญที่ควรรู้</h3>
+        <table>
+          <thead>
+            <tr>
+              <th>คำ</th>
+              <th>ความหมายแบบง่าย</th>
+              <th>Night v3 ใช้ทำอะไร</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><code>Probe Request</code></td>
+              <td>สัญญาณที่มือถือหรือ laptop ส่งออกมาเพื่อถามว่ามี Wi-Fi อะไรอยู่ใกล้บ้าง</td>
+              <td>ใช้เป็นหลักฐานว่า client device กำลัง active อยู่ใกล้ ๆ</td>
+            </tr>
+            <tr>
+              <td><code>Beacon</code></td>
+              <td>สัญญาณที่ router หรือ access point ส่งออกมาเพื่อประกาศชื่อเครือข่าย</td>
+              <td>บันทึกไว้เป็นข้อมูลสภาพแวดล้อม แต่ไม่เอามานับเป็นคนในห้อง</td>
+            </tr>
+            <tr>
+              <td><code>RSSI</code></td>
+              <td>ความแรงสัญญาณ ค่าใกล้ศูนย์กว่าคือแรงกว่า เช่น <code>-45</code> แรงกว่า <code>-80</code></td>
+              <td>ใช้เดาระยะและแบ่ง zone เช่น near, mid, far</td>
+            </tr>
+            <tr>
+              <td><code>IE Fingerprint</code></td>
+              <td>ลายเซ็นจาก Information Elements ใน Wi-Fi frame</td>
+              <td>ใช้เป็นหนึ่งในหลักฐานว่า randomized MAC หลายตัวอาจเป็นเครื่องเดียวกัน</td>
+            </tr>
+            <tr>
+              <td><code>Randomized MAC</code></td>
+              <td>MAC ชั่วคราวที่ระบบปฏิบัติการสร้างขึ้นเพื่อไม่ให้ติดตามเครื่องจริงได้ง่าย</td>
+              <td>ต้องใช้ scoring และ session logic เพื่อกันการนับซ้ำ</td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+
+      <section id="v3-th-flow">
+        <h2>ลำดับการทำงานของ Packet ใน Night v3</h2>
+        <p>
+          ฟังก์ชันหลักคือ <code>handle_packet(pkt)</code>. ให้คิดว่ามันเป็นด่านตรวจของ packet:
+          packet เข้ามา, โปรแกรมดูว่าเป็น frame ชนิดไหน, ดึงข้อมูลสำคัญออกมา, เขียนลง CSV,
+          แล้วถ้าเป็น client frame ก็เอาไปอัปเดต session
+        </p>
+        <ol class="flow">
+          <li>
+            <div>
+              <strong>แยกประเภท frame</strong>
+              <span>ตรวจว่าเป็น Probe, Beacon, Association, Authentication, Deauthentication หรือ Disassociation</span>
+            </div>
+          </li>
+          <li>
+            <div>
+              <strong>เลือก MAC ที่ถูกต้อง</strong>
+              <span>client frame ใช้ <code>addr2</code> เพราะเป็นตัวส่ง. Beacon ใช้ BSSID ของ access point</span>
+            </div>
+          </li>
+          <li>
+            <div>
+              <strong>อ่านข้อมูลสัญญาณ</strong>
+              <span>ถ้ามี <code>RadioTap</code> จะอ่าน RSSI, channel และ band เช่น 2.4GHz, 5GHz หรือ 6GHz</span>
+            </div>
+          </li>
+          <li>
+            <div>
+              <strong>เดาระยะใกล้ไกล</strong>
+              <span><code>calculate_distance()</code> แปลง RSSI เป็นเมตรแบบคร่าว ๆ แล้ว <code>proximity_zone()</code> แบ่งเป็น immediate, near, mid, far</span>
+            </div>
+          </li>
+          <li>
+            <div>
+              <strong>สร้าง fingerprint</strong>
+              <span><code>extract_ie_details()</code> อ่าน IE sequence, IE fingerprint, Vendor IE และ capabilities</span>
+            </div>
+          </li>
+          <li>
+            <div>
+              <strong>อัปเดต session และ log</strong>
+              <span>ถ้าเป็น client frame จะเข้า <code>track_session()</code>. ทุก frame ที่รับได้จะถูกเขียนลง CSV เพื่อใช้ตรวจสอบย้อนหลัง</span>
+            </div>
+          </li>
+        </ol>
+        <pre><code>ตัวอย่าง:
+มือถือส่ง Probe Request
+  MAC: 02:11:22:33:44:55
+  RSSI: -53 dBm
+  SSID: Office
+  IE fingerprint: abc123
+
+Night v3 จะบันทึกว่า:
+  MAC type: Randomized
+  zone: near
+  session: New-User-1 หรือรวมกับ session เดิมถ้าหลักฐานพอ
+  CSV: เก็บหลักฐานของ packet นี้ไว้</code></pre>
+      </section>
+
+      <section id="v3-th-sessions">
+        <h2>Session Logic แบบเข้าใจง่าย</h2>
+        <p>
+          <code>Session</code> คือหน่วยความจำของโปรแกรมว่า "กลุ่ม packet นี้น่าจะมาจากอุปกรณ์หรือผู้ใช้คนเดียวกัน".
+          จุดสำคัญคือไม่ใช่ทุก MAC จะถูกนับเป็นคนใหม่ทันที โดยเฉพาะ randomized MAC
+        </p>
+        <h3>ถ้าเป็น MAC เดิม</h3>
+        <p>
+          ถ้า packet ใหม่มี MAC อยู่ใน <code>session.all_macs</code> อยู่แล้ว โปรแกรมจะอัปเดต session เดิมทันที.
+          วิธีนี้ช่วยกันการนับ packet ซ้ำจากเครื่องเดิม
+        </p>
+        <h3>ถ้าเป็น Real MAC</h3>
+        <p>
+          ถ้า <code>check_mac_type()</code> มองว่าเป็น MAC จริงของผู้ผลิต โปรแกรมจะไม่รวมกับ real MAC ตัวอื่นง่าย ๆ.
+          เหตุผลคือ real MAC มักเป็นตัวตนที่ค่อนข้างคงที่ ถ้ารวมผิดจะทำให้คนสองคนถูกนับเป็นคนเดียว
+        </p>
+        <h3>ถ้าเป็น Randomized MAC</h3>
+        <p>
+          โปรแกรมจะให้คะแนนว่ามันควรรวมกับ session เดิมไหม โดยดูหลักฐานหลายอย่างร่วมกัน:
+        </p>
+        <table>
+          <thead>
+            <tr>
+              <th>หลักฐาน</th>
+              <th>ทำไมช่วยได้</th>
+              <th>ผลต่อคะแนน</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>IE fingerprint เหมือนกัน</td>
+              <td>รูปแบบ IE คล้ายกันมาก อาจเป็นอุปกรณ์เดิม</td>
+              <td><code>+3</code></td>
+            </tr>
+            <tr>
+              <td>Vendor IE ซ้ำกัน</td>
+              <td>เจอ vendor-specific extension เหมือนกัน</td>
+              <td><code>+2</code></td>
+            </tr>
+            <tr>
+              <td>Probe SSID ซ้ำกัน</td>
+              <td>ถามหา network name เดียวกัน</td>
+              <td><code>+2</code></td>
+            </tr>
+            <tr>
+              <td>RSSI ใกล้กันหรือ zone เดียวกัน</td>
+              <td>สัญญาณบอกว่าน่าจะอยู่บริเวณเดียวกัน</td>
+              <td><code>+1</code> ถึง <code>+2</code></td>
+            </tr>
+            <tr>
+              <td>เวลาใกล้กันและ frame type คล้ายกัน</td>
+              <td>เป็นหลักฐานเสริมว่าพฤติกรรมต่อเนื่องกัน</td>
+              <td><code>+1</code> แต่ละข้อ</td>
+            </tr>
+          </tbody>
+        </table>
+        <div class="example warning">
+          Night v3 ตั้งใจ conservative: ต้องได้คะแนนถึง <code>GROUP_SCORE_THRESHOLD</code>,
+          ต้องมีเหตุผลสนับสนุนมากกว่าหนึ่งอย่าง และไม่รวม session ที่เวลา overlap กัน.
+          เป้าหมายคือกันการรวมคนสองคนเป็นคนเดียว ซึ่งอันตรายกว่าการบอกช่วงจำนวนคนแบบเผื่อไว้
+        </div>
+      </section>
+
+      <section id="v3-th-functions" class="footer">
+        <h2>ควรอ่านโค้ด Night v3 ตรงไหนก่อน</h2>
+        <table>
+          <thead>
+            <tr>
+              <th>ส่วนของโค้ด</th>
+              <th>หน้าที่</th>
+              <th>คำแนะนำ</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><code>CSV_FIELDS</code></td>
+              <td>กำหนด column ของ packet log</td>
+              <td>อ่านก่อนเพื่อรู้ว่าโปรแกรมเก็บหลักฐานอะไรบ้าง</td>
+            </tr>
+            <tr>
+              <td><code>Session</code></td>
+              <td>เก็บข้อมูลของ user/device session</td>
+              <td>เป็นหัวใจของการนับคนแบบไม่ double-count</td>
+            </tr>
+            <tr>
+              <td><code>extract_ie_details()</code></td>
+              <td>สร้าง IE sequence, fingerprint, Vendor IE และ capabilities</td>
+              <td>ช่วยเข้าใจว่าทำไม v3 แยกอุปกรณ์ได้ละเอียดขึ้น</td>
+            </tr>
+            <tr>
+              <td><code>track_session()</code></td>
+              <td>สร้าง, อัปเดต หรือรวม session</td>
+              <td>อ่านส่วนนี้ถ้าต้องการเข้าใจการกัน randomized MAC นับซ้ำ</td>
+            </tr>
+            <tr>
+              <td><code>handle_packet()</code></td>
+              <td>รับ packet, ดึงข้อมูล, เรียก session logic และเขียน CSV</td>
+              <td>อ่านหลัง helper functions เพื่อเห็น flow ทั้งหมด</td>
+            </tr>
+            <tr>
+              <td><code>generate_session_report()</code></td>
+              <td>เขียน daily summary ของ session</td>
+              <td>ใช้ดูผลลัพธ์แนว occupancy</td>
+            </tr>
+          </tbody>
+        </table>
+        <h3>สรุปสั้น ๆ</h3>
+        <p>
+          v0.7 เหมาะสำหรับดูว่าเห็น MAC และ Wi-Fi frame อะไรบ้าง.
+          Night v3 จริงจังกว่า เพราะเพิ่มชนิด packet, IE fingerprinting,
+          randomized MAC correlation, RSSI statistics, band/channel detection
+          และ report ที่ช่วยตรวจสอบเหตุผลของการนับคนได้ดีกว่า
+        </p>
+      </section>
+      </div>
+      </div>
     </main>
   </div>
+  <script>
+    const tabButtons = document.querySelectorAll("[data-tab-target]");
+    const tabPanels = document.querySelectorAll("[data-tab-panel]");
+    const navPanels = document.querySelectorAll("[data-nav]");
+    const langButtons = document.querySelectorAll("[data-lang-target]");
+    const langPanels = document.querySelectorAll("[data-lang-panel]");
+
+    function showTab(tabName) {
+      tabButtons.forEach((button) => {
+        button.setAttribute("aria-selected", String(button.dataset.tabTarget === tabName));
+      });
+      tabPanels.forEach((panel) => {
+        panel.hidden = panel.dataset.tabPanel !== tabName;
+      });
+      navPanels.forEach((nav) => {
+        nav.hidden = nav.dataset.nav !== tabName;
+      });
+    }
+
+    function showLanguage(language) {
+      langButtons.forEach((button) => {
+        button.setAttribute("aria-pressed", String(button.dataset.langTarget === language));
+      });
+      langPanels.forEach((panel) => {
+        panel.hidden = panel.dataset.langPanel !== language;
+      });
+    }
+
+    tabButtons.forEach((button) => {
+      button.addEventListener("click", () => showTab(button.dataset.tabTarget));
+    });
+
+    langButtons.forEach((button) => {
+      button.addEventListener("click", () => showLanguage(button.dataset.langTarget));
+    });
+  </script>
 </body>
 </html>
