@@ -16,8 +16,8 @@ fake_scapy_all.sniff = lambda *args, **kwargs: None
 fake_scapy_layers = types.ModuleType("scapy.layers")
 fake_dot11 = types.ModuleType("scapy.layers.dot11")
 for name in (
-    "Dot11", "Dot11ProbeReq", "Dot11Beacon", "Dot11AssoReq",
-    "Dot11ReassoReq", "Dot11Auth", "Dot11Deauth", "Dot11Disas",
+    "Dot11", "Dot11ProbeReq", "Dot11Beacon", "Dot11AssoReq", "Dot11AssoResp",
+    "Dot11ReassoReq", "Dot11ReassoResp", "Dot11Auth", "Dot11Deauth", "Dot11Disas",
     "RadioTap", "Dot11Elt", "Dot11EltVendorSpecific",
 ):
     setattr(fake_dot11, name, type(name, (), {}))
