@@ -257,6 +257,34 @@ def lookup_oui(oui_hex: str) -> str:
     return KNOWN_OUIS.get(oui_hex.lower(), f"Unknown({oui_hex})")
 
 
+def vendor_from_ie_ouis(vendor_ies: str) -> str:
+    """
+    Resolve a friendly vendor name from Vendor Specific (tag 221) OUIs.
+
+    Used for randomized MACs, which carry no real vendor OUI of their own —
+    but the tag-221 elements a device advertises still leak the chipset /
+    software-stack vendor. Tries the curated KNOWN_OUIS names first, falls
+    back to the full mac_vendor_lookup database, and finally returns the raw
+    OUI list when nothing resolves. Returns "Unknown" when no tag-221 OUIs
+    were present at all.
+    """
+    ouis = sorted(_parse_set(vendor_ies))
+    if not ouis:
+        return "Unknown"
+    for oui in ouis:
+        name = lookup_oui(oui)
+        if "Unknown" not in name:
+            return name
+    for oui in ouis:
+        try:
+            name = _vendor_lookup.lookup(oui + ":00:00:00")
+        except Exception:
+            continue
+        if name:
+            return name
+    return f"Unknown({';'.join(ouis)})"
+
+
 def oui_int_to_str(raw_oui: int) -> str:
     """Convert a 3-byte integer OUI to colon-separated hex string."""
     return ":".join(f"{b:02x}" for b in raw_oui.to_bytes(3, "big"))
@@ -880,13 +908,21 @@ def handle_packet(pkt) -> None:
     dist_m       = calculate_distance(power)
     zone         = proximity_zone(dist_m)
     mac_type     = check_mac_type(mac_addr)
-    vendor       = get_vendor(mac_addr, mac_type)
     now          = time.time()
     interval     = round(now - _last_seen.get(mac_addr, now), 2)
     _last_seen[mac_addr] = now
 
     identity     = get_correlation_identity(pkt)
     ie_details   = extract_ie_details(pkt)
+
+    # Vendor column: a real (burned-in) MAC has a genuine OUI, so look it up
+    # in the vendor database. A randomized MAC has no real OUI to resolve —
+    # instead surface the vendor advertised in its tag-221 Vendor Specific
+    # IEs. The raw OUIs stay in the separate Vendor_IEs column either way.
+    if mac_type == "Real":
+        vendor = get_vendor(mac_addr, mac_type)
+    else:
+        vendor = vendor_from_ie_ouis(ie_details["vendor_ies"])
     if pkt_type in CLIENT_FRAME_TYPES:
         session_note = track_session(
             mac_addr, identity, power, zone, [ssid], pkt_type,

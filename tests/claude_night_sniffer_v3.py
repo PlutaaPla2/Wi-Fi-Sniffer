@@ -217,6 +217,30 @@ class VendorLookupTests(unittest.TestCase):
             self.assertEqual(ns.get_vendor("00:11:22:33:44:55", "Real"), "Unknown")
 
 
+class VendorFromIeOuisTests(unittest.TestCase):
+    def test_prefers_curated_known_oui_name(self):
+        self.assertEqual(ns.vendor_from_ie_ouis("00:17:f2"), "Apple, Inc.")
+
+    def test_empty_tag221_is_unknown(self):
+        self.assertEqual(ns.vendor_from_ie_ouis(""), "Unknown")
+
+    def test_falls_back_to_full_vendor_database(self):
+        with patch.object(ns._vendor_lookup, "lookup", return_value="Realtek Semiconductor"):
+            self.assertEqual(ns.vendor_from_ie_ouis("52:54:00"), "Realtek Semiconductor")
+
+    def test_full_database_lookup_gets_padded_to_a_mac(self):
+        with patch.object(ns._vendor_lookup, "lookup", return_value="Realtek") as mock_lookup:
+            ns.vendor_from_ie_ouis("52:54:00")
+        mock_lookup.assert_called_once_with("52:54:00:00:00:00")
+
+    def test_unresolved_oui_returns_raw_list(self):
+        with patch.object(ns._vendor_lookup, "lookup", side_effect=KeyError("nope")):
+            self.assertEqual(ns.vendor_from_ie_ouis("aa:bb:cc"), "Unknown(aa:bb:cc)")
+
+    def test_first_recognized_oui_wins_over_unknown(self):
+        self.assertEqual(ns.vendor_from_ie_ouis("aa:bb:cc;00:17:f2"), "Apple, Inc.")
+
+
 class FrequencyHelperTests(unittest.TestCase):
     def test_2ghz_channel_and_band(self):
         self.assertEqual(ns._freq_to_channel(2412), 1)
