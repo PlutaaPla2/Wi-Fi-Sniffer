@@ -198,10 +198,16 @@ def setup_csv() -> None:
 
 
 def setup_ie_csv() -> None:
-    """Create the per-IE breakdown CSV with its header row if absent."""
-    if not os.path.exists(IE_DETAILS_FILE):
-        with open(IE_DETAILS_FILE, "w", newline="") as fh:
-            csv.writer(fh).writerow(IE_CSV_FIELDS)
+    """
+    Start a fresh per-IE breakdown CSV with its header row.
+
+    Unlike the main recon log (which accumulates across runs), this file is
+    truncated on every startup so it only holds the current session's IEs —
+    mirroring the daily summary. That keeps the two reports aligned for
+    cross-checking devices seen in the same session.
+    """
+    with open(IE_DETAILS_FILE, "w", newline="") as fh:
+        csv.writer(fh).writerow(IE_CSV_FIELDS)
 
 
 def calculate_distance(rssi: int) -> float:

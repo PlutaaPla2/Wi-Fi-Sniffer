@@ -484,6 +484,16 @@ class CsvSetupTests(unittest.TestCase):
                 rows = list(csv.reader(fh))
         self.assertEqual(rows, [ns.IE_CSV_FIELDS])
 
+    def test_setup_ie_csv_truncates_previous_session(self):
+        # Unlike the main log, the IE report holds only the current session so it
+        # can be cross-checked against the daily summary — startup wipes stale rows.
+        self.tmp_file.write_text("old,session,data\n1,2,3\n")
+        with patch.object(ns, "IE_DETAILS_FILE", str(self.tmp_file)):
+            ns.setup_ie_csv()
+            with open(self.tmp_file, newline="") as fh:
+                rows = list(csv.reader(fh))
+        self.assertEqual(rows, [ns.IE_CSV_FIELDS])
+
     def test_append_csv_row_appends_after_header(self):
         self.tmp_file.write_text("")
         with open(self.tmp_file, "w", newline="") as fh:
