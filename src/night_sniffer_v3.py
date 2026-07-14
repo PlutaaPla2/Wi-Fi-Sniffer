@@ -56,6 +56,13 @@ CLIENT_FRAME_TYPES = {
     "PROBE", "ASSOC_REQ", "REASSOC_REQ", "AUTH", "DEAUTH", "DISASSOC",
 }
 
+# Which frame types appear in the real-time terminal log. This affects the
+# terminal output only — every frame is still written to the CSV regardless.
+#   "all"       → print every tracked frame type
+#   "no-beacon" → print every frame except BEACON
+# Set from the --frames CLI flag in main().
+TERMINAL_FRAME_FILTER = "all"
+
 CSV_FIELDS = [
     "Timestamp", "Pkt_Type", "MAC_Address", "Device_Type",
     "Vendor", "SSID", "Channel", "Band", "Power_dBm", "Distance_m",
@@ -967,15 +974,18 @@ def handle_packet(pkt) -> None:
     final_note = f"{session_note} | {identity}"
     colour     = _pick_colour(identity)
 
-    # Print every tracked frame type in real time. Client frames are tagged
-    # [C]; AP/other management frames (beacons today, anything new added to
-    # classify_frame() in future) are tagged [A] so both show up live.
-    frame_tag = "[C]" if pkt_type in CLIENT_FRAME_TYPES else "[A]"
-    print(
-        f"{colour}{frame_tag} {timestamp} | {pkt_type:<11} | {mac_addr} | "
-        f"CH:{str(channel):<3}| {power:>4}dBm | {dist_m:>5}m | "
-        f"SSID: {ssid:<20} | {identity}{COLOUR_RESET}"
-    )
+    # Print tracked frame types in real time. Client frames are tagged [C];
+    # AP/other management frames (beacons today, anything new added to
+    # classify_frame() in future) are tagged [A]. The --frames flag can suppress
+    # BEACON frames from the terminal; CSV logging below is unaffected.
+    show_in_terminal = TERMINAL_FRAME_FILTER == "all" or pkt_type != "BEACON"
+    if show_in_terminal:
+        frame_tag = "[C]" if pkt_type in CLIENT_FRAME_TYPES else "[A]"
+        print(
+            f"{colour}{frame_tag} {timestamp} | {pkt_type:<11} | {mac_addr} | "
+            f"CH:{str(channel):<3}| {power:>4}dBm | {dist_m:>5}m | "
+            f"SSID: {ssid:<20} | {identity}{COLOUR_RESET}"
+        )
 
     _append_csv_row([
         timestamp, pkt_type, mac_addr, mac_type,
@@ -1028,7 +1038,18 @@ def main() -> None:
         action="store_true",
         help="Enable active channel hopping with iw. Disabled by default.",
     )
+    parser.add_argument(
+        "--frames",
+        choices=["all", "no-beacon"],
+        default="all",
+        help="Which frame types to show in the real-time terminal log: "
+             "'all' (default) shows every frame; 'no-beacon' hides BEACON "
+             "frames. Does not affect CSV logging.",
+    )
     args = parser.parse_args()
+
+    global TERMINAL_FRAME_FILTER
+    TERMINAL_FRAME_FILTER = args.frames
 
     setup_csv()
     setup_ie_csv()
@@ -1037,6 +1058,7 @@ def main() -> None:
     log.info("Logging packets to            : %s", LOG_FILE)
     log.info("Logging IE breakdown to       : %s", IE_DETAILS_FILE)
     log.info("Max reconnect attempts        : %d", MAX_RETRIES)
+    log.info("Terminal frame filter         : %s", TERMINAL_FRAME_FILTER)
 
     sep = "-" * 110
     print(sep)
