@@ -940,12 +940,15 @@ def handle_packet(pkt) -> None:
     final_note = f"{session_note} | {identity}"
     colour     = _pick_colour(identity)
 
-    if pkt_type in CLIENT_FRAME_TYPES:
-        print(
-            f"{colour}[C] {timestamp} | {pkt_type:<11} | {mac_addr} | "
-            f"CH:{str(channel):<3}| {power:>4}dBm | {dist_m:>5}m | "
-            f"SSID: {ssid:<20} | {identity}{COLOUR_RESET}"
-        )
+    # Print every tracked frame type in real time. Client frames are tagged
+    # [C]; AP/other management frames (beacons today, anything new added to
+    # classify_frame() in future) are tagged [A] so both show up live.
+    frame_tag = "[C]" if pkt_type in CLIENT_FRAME_TYPES else "[A]"
+    print(
+        f"{colour}{frame_tag} {timestamp} | {pkt_type:<11} | {mac_addr} | "
+        f"CH:{str(channel):<3}| {power:>4}dBm | {dist_m:>5}m | "
+        f"SSID: {ssid:<20} | {identity}{COLOUR_RESET}"
+    )
 
     _append_csv_row([
         timestamp, pkt_type, mac_addr, mac_type,
