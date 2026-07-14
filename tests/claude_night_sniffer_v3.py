@@ -217,6 +217,30 @@ class VendorLookupTests(unittest.TestCase):
             self.assertEqual(ns.get_vendor("00:11:22:33:44:55", "Real"), "Unknown")
 
 
+class VendorFromIeOuisTests(unittest.TestCase):
+    def test_prefers_curated_known_oui_name(self):
+        self.assertEqual(ns.vendor_from_ie_ouis("00:17:f2"), "Apple, Inc.")
+
+    def test_empty_tag221_is_unknown(self):
+        self.assertEqual(ns.vendor_from_ie_ouis(""), "Unknown")
+
+    def test_falls_back_to_full_vendor_database(self):
+        with patch.object(ns._vendor_lookup, "lookup", return_value="Realtek Semiconductor"):
+            self.assertEqual(ns.vendor_from_ie_ouis("52:54:00"), "Realtek Semiconductor")
+
+    def test_full_database_lookup_gets_padded_to_a_mac(self):
+        with patch.object(ns._vendor_lookup, "lookup", return_value="Realtek") as mock_lookup:
+            ns.vendor_from_ie_ouis("52:54:00")
+        mock_lookup.assert_called_once_with("52:54:00:00:00:00")
+
+    def test_unresolved_oui_returns_raw_list(self):
+        with patch.object(ns._vendor_lookup, "lookup", side_effect=KeyError("nope")):
+            self.assertEqual(ns.vendor_from_ie_ouis("aa:bb:cc"), "Unknown(aa:bb:cc)")
+
+    def test_first_recognized_oui_wins_over_unknown(self):
+        self.assertEqual(ns.vendor_from_ie_ouis("aa:bb:cc;00:17:f2"), "Apple, Inc.")
+
+
 class FrequencyHelperTests(unittest.TestCase):
     def test_2ghz_channel_and_band(self):
         self.assertEqual(ns._freq_to_channel(2412), 1)
@@ -454,6 +478,16 @@ class CsvSetupTests(unittest.TestCase):
         self.assertEqual(self.tmp_file.read_text(), "not,a,header\n1,2,3\n")
 
     def test_setup_ie_csv_creates_header_when_missing(self):
+        with patch.object(ns, "IE_DETAILS_FILE", str(self.tmp_file)):
+            ns.setup_ie_csv()
+            with open(self.tmp_file, newline="") as fh:
+                rows = list(csv.reader(fh))
+        self.assertEqual(rows, [ns.IE_CSV_FIELDS])
+
+    def test_setup_ie_csv_truncates_previous_session(self):
+        # Unlike the main log, the IE report holds only the current session so it
+        # can be cross-checked against the daily summary — startup wipes stale rows.
+        self.tmp_file.write_text("old,session,data\n1,2,3\n")
         with patch.object(ns, "IE_DETAILS_FILE", str(self.tmp_file)):
             ns.setup_ie_csv()
             with open(self.tmp_file, newline="") as fh:

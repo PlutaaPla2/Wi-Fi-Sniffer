@@ -198,10 +198,16 @@ def setup_csv() -> None:
 
 
 def setup_ie_csv() -> None:
-    """Create the per-IE breakdown CSV with its header row if absent."""
-    if not os.path.exists(IE_DETAILS_FILE):
-        with open(IE_DETAILS_FILE, "w", newline="") as fh:
-            csv.writer(fh).writerow(IE_CSV_FIELDS)
+    """
+    Start a fresh per-IE breakdown CSV with its header row.
+
+    Unlike the main recon log (which accumulates across runs), this file is
+    truncated on every startup so it only holds the current session's IEs —
+    mirroring the daily summary. That keeps the two reports aligned for
+    cross-checking devices seen in the same session.
+    """
+    with open(IE_DETAILS_FILE, "w", newline="") as fh:
+        csv.writer(fh).writerow(IE_CSV_FIELDS)
 
 
 def calculate_distance(rssi: int) -> float:
@@ -255,6 +261,34 @@ def oui_from_mac(mac: str) -> str:
 def lookup_oui(oui_hex: str) -> str:
     """Return a friendly vendor name from KNOWN_OUIS, or a default string."""
     return KNOWN_OUIS.get(oui_hex.lower(), f"Unknown({oui_hex})")
+
+
+def vendor_from_ie_ouis(vendor_ies: str) -> str:
+    """
+    Resolve a friendly vendor name from Vendor Specific (tag 221) OUIs.
+
+    Used for randomized MACs, which carry no real vendor OUI of their own —
+    but the tag-221 elements a device advertises still leak the chipset /
+    software-stack vendor. Tries the curated KNOWN_OUIS names first, falls
+    back to the full mac_vendor_lookup database, and finally returns the raw
+    OUI list when nothing resolves. Returns "Unknown" when no tag-221 OUIs
+    were present at all.
+    """
+    ouis = sorted(_parse_set(vendor_ies))
+    if not ouis:
+        return "Unknown"
+    for oui in ouis:
+        name = lookup_oui(oui)
+        if "Unknown" not in name:
+            return name
+    for oui in ouis:
+        try:
+            name = _vendor_lookup.lookup(oui + ":00:00:00")
+        except Exception:
+            continue
+        if name:
+            return name
+    return f"Unknown({';'.join(ouis)})"
 
 
 def oui_int_to_str(raw_oui: int) -> str:
@@ -880,13 +914,21 @@ def handle_packet(pkt) -> None:
     dist_m       = calculate_distance(power)
     zone         = proximity_zone(dist_m)
     mac_type     = check_mac_type(mac_addr)
-    vendor       = get_vendor(mac_addr, mac_type)
     now          = time.time()
     interval     = round(now - _last_seen.get(mac_addr, now), 2)
     _last_seen[mac_addr] = now
 
     identity     = get_correlation_identity(pkt)
     ie_details   = extract_ie_details(pkt)
+
+    # Vendor column: a real (burned-in) MAC has a genuine OUI, so look it up
+    # in the vendor database. A randomized MAC has no real OUI to resolve —
+    # instead surface the vendor advertised in its tag-221 Vendor Specific
+    # IEs. The raw OUIs stay in the separate Vendor_IEs column either way.
+    if mac_type == "Real":
+        vendor = get_vendor(mac_addr, mac_type)
+    else:
+        vendor = vendor_from_ie_ouis(ie_details["vendor_ies"])
     if pkt_type in CLIENT_FRAME_TYPES:
         session_note = track_session(
             mac_addr, identity, power, zone, [ssid], pkt_type,
@@ -898,12 +940,15 @@ def handle_packet(pkt) -> None:
     final_note = f"{session_note} | {identity}"
     colour     = _pick_colour(identity)
 
-    if pkt_type in CLIENT_FRAME_TYPES:
-        print(
-            f"{colour}[C] {timestamp} | {pkt_type:<11} | {mac_addr} | "
-            f"CH:{str(channel):<3}| {power:>4}dBm | {dist_m:>5}m | "
-            f"SSID: {ssid:<20} | {identity}{COLOUR_RESET}"
-        )
+    # Print every tracked frame type in real time. Client frames are tagged
+    # [C]; AP/other management frames (beacons today, anything new added to
+    # classify_frame() in future) are tagged [A] so both show up live.
+    frame_tag = "[C]" if pkt_type in CLIENT_FRAME_TYPES else "[A]"
+    print(
+        f"{colour}{frame_tag} {timestamp} | {pkt_type:<11} | {mac_addr} | "
+        f"CH:{str(channel):<3}| {power:>4}dBm | {dist_m:>5}m | "
+        f"SSID: {ssid:<20} | {identity}{COLOUR_RESET}"
+    )
 
     _append_csv_row([
         timestamp, pkt_type, mac_addr, mac_type,
