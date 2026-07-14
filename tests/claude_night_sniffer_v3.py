@@ -78,8 +78,9 @@ class FakePacket:
 class VendorNode:
     """One link in a fake Dot11EltVendorSpecific chain."""
 
-    def __init__(self, oui, next_node=None):
+    def __init__(self, oui, info=b"", next_node=None):
         self.oui = oui
+        self.info = info
         self._next = next_node
 
     @property
@@ -168,6 +169,17 @@ class DistanceAndZoneTests(unittest.TestCase):
         self.assertEqual(ns.proximity_zone(20.01), "far")
 
 
+class SequenceDeltaTests(unittest.TestCase):
+    def test_small_forward_step(self):
+        self.assertEqual(ns.seq_delta(105, 100), 5)
+
+    def test_wraparound(self):
+        self.assertEqual(ns.seq_delta(3, 4095), 4)
+
+    def test_equal_inputs(self):
+        self.assertEqual(ns.seq_delta(1234, 1234), 0)
+
+
 class MacHelperTests(unittest.TestCase):
     def test_locally_administered_bit_means_randomized(self):
         self.assertEqual(ns.check_mac_type("02:11:22:33:44:55"), "Randomized")
@@ -239,6 +251,11 @@ class VendorFromIeOuisTests(unittest.TestCase):
 
     def test_first_recognized_oui_wins_over_unknown(self):
         self.assertEqual(ns.vendor_from_ie_ouis("aa:bb:cc;00:17:f2"), "Apple, Inc.")
+
+    def test_microsoft_protocol_oui_is_not_a_device_vendor(self):
+        with patch.object(ns._vendor_lookup, "lookup") as mock_lookup:
+            self.assertEqual(ns.vendor_from_ie_ouis("00:50:F2"), "Unknown")
+        mock_lookup.assert_not_called()
 
 
 class FrequencyHelperTests(unittest.TestCase):
@@ -330,9 +347,9 @@ class ClassifyFrameTests(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 class ExtractSsidTests(unittest.TestCase):
-    def test_prefers_top_level_info_attribute(self):
-        pkt = SsidPacket(info=b"HomeWifi")
-        self.assertEqual(ns.extract_ssid(pkt, "(fallback)"), "HomeWifi")
+    def test_ignores_non_ssid_top_level_info_attribute(self):
+        pkt = SsidPacket(info=b"not-an-ssid")
+        self.assertEqual(ns.extract_ssid(pkt, "(fallback)"), "(fallback)")
 
     def test_falls_back_to_ssid_information_element(self):
         pkt = SsidPacket(info=b"", elt_info=b"OfficeWifi")
@@ -362,14 +379,14 @@ class CorrelationIdentityTests(unittest.TestCase):
         )
         self.assertEqual(ns.get_correlation_identity(pkt), "Apple Device (TH/EU)")
 
-    def test_windows_vendor_tag(self):
+    def test_wmm_vendor_tag_does_not_imply_windows_or_microsoft(self):
         pkt = IdentityPacket(
-            addr2="11:22:33:44:55:66", vendor_chain=VendorNode(0x0050F2)
+            addr2="11:22:33:44:55:66",
+            vendor_chain=VendorNode(0x0050F2, info=b"\x02"),
         )
-        self.assertEqual(
-            ns.get_correlation_identity(pkt),
-            "Windows/PC (Microsoft (Surface/WPS))",
-        )
+        identity = ns.get_correlation_identity(pkt)
+        self.assertNotIn("Windows", identity)
+        self.assertNotIn("Microsoft", identity)
 
     def test_iot_vendor_from_mac_oui_alone(self):
         pkt = IdentityPacket(addr2="84:E1:BA:11:22:33", vendor_chain=None)
@@ -470,6 +487,7 @@ class CsvSetupTests(unittest.TestCase):
             with open(self.tmp_file, newline="") as fh:
                 rows = list(csv.reader(fh))
         self.assertEqual(rows, [ns.CSV_FIELDS])
+        self.assertEqual(ns.CSV_FIELDS[-1], "Seq_Num")
 
     def test_setup_csv_does_not_clobber_existing_file(self):
         self.tmp_file.write_text("not,a,header\n1,2,3\n")

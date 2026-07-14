@@ -62,6 +62,7 @@ class NightSnifferV3SessionTests(unittest.TestCase):
                 ie_fingerprint="abc123",
                 vendor_ies="00:17:f2",
                 mac_type="Randomized",
+                seq=100,
             )
 
         with patch.object(night_sniffer_v3.time, "time", return_value=1070.0):
@@ -75,11 +76,13 @@ class NightSnifferV3SessionTests(unittest.TestCase):
                 ie_fingerprint="abc123",
                 vendor_ies="00:17:f2",
                 mac_type="Randomized",
+                seq=104,
             )
 
         self.assertEqual(first, "New-User-1")
         self.assertEqual(second, "Existing-User-1")
         self.assertEqual(len(night_sniffer_v3.active_sessions), 1)
+        self.assertEqual(night_sniffer_v3.active_sessions[1].last_seq, 104)
 
     def test_does_not_merge_overlapping_randomized_macs(self):
         with patch.object(night_sniffer_v3.time, "time", return_value=1000.0):
@@ -93,6 +96,7 @@ class NightSnifferV3SessionTests(unittest.TestCase):
                 ie_fingerprint="abc123",
                 vendor_ies="00:17:f2",
                 mac_type="Randomized",
+                seq=200,
             )
 
         with patch.object(night_sniffer_v3.time, "time", return_value=1002.0):
@@ -106,6 +110,7 @@ class NightSnifferV3SessionTests(unittest.TestCase):
                 ie_fingerprint="abc123",
                 vendor_ies="00:17:f2",
                 mac_type="Randomized",
+                seq=204,
             )
 
         self.assertEqual(note, "New-User-2")
@@ -123,6 +128,7 @@ class NightSnifferV3SessionTests(unittest.TestCase):
                 ie_fingerprint="abc123",
                 vendor_ies="00:50:f2",
                 mac_type="Real",
+                seq=300,
             )
 
         with patch.object(night_sniffer_v3.time, "time", return_value=1010.0):
@@ -136,6 +142,7 @@ class NightSnifferV3SessionTests(unittest.TestCase):
                 ie_fingerprint="abc123",
                 vendor_ies="00:50:f2",
                 mac_type="Real",
+                seq=304,
             )
 
         self.assertEqual(note, "New-User-2")
@@ -158,6 +165,46 @@ class NightSnifferV3IeTests(unittest.TestCase):
 
         self.assertEqual(details["ie_sequence"], "0,255,221")
         self.assertEqual(details["vendor_ies"], "00:50:f2")
+
+
+class NightSnifferV3PacketHandlerTests(unittest.TestCase):
+    def test_sequence_number_reaches_session_and_final_csv_column(self):
+        class FakePacket:
+            dot11 = types.SimpleNamespace(SC=(321 << 4) | 7)
+
+            def haslayer(self, layer):
+                return layer is night_sniffer_v3.Dot11
+
+            def __getitem__(self, layer):
+                return self.dot11
+
+        ie_details = {
+            "ie_sequence": "",
+            "ie_fingerprint": "",
+            "vendor_ies": "",
+            "capabilities": "",
+        }
+        with patch.object(
+            night_sniffer_v3,
+            "classify_frame",
+            return_value=("PROBE", "02:11:22:33:44:55"),
+        ), patch.object(
+            night_sniffer_v3, "extract_ssid", return_value="(Wildcard)"
+        ), patch.object(
+            night_sniffer_v3, "get_correlation_identity", return_value="Unknown"
+        ), patch.object(
+            night_sniffer_v3, "extract_ie_details", return_value=ie_details
+        ), patch.object(
+            night_sniffer_v3, "track_session", return_value="New-User-1"
+        ) as track_session, patch.object(
+            night_sniffer_v3, "_append_csv_row"
+        ) as append_row, patch.object(
+            night_sniffer_v3, "dump_ie_details"
+        ), patch("builtins.print"):
+            night_sniffer_v3.handle_packet(FakePacket())
+
+        self.assertEqual(track_session.call_args.args[-1], 321)
+        self.assertEqual(append_row.call_args.args[0][-1], 321)
 
 
 if __name__ == "__main__":

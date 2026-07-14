@@ -60,7 +60,7 @@ CSV_FIELDS = [
     "Timestamp", "Pkt_Type", "MAC_Address", "Device_Type",
     "Vendor", "SSID", "Channel", "Band", "Power_dBm", "Distance_m",
     "Interval_sec", "IE_Sequence", "IE_Fingerprint", "Vendor_IEs",
-    "Capabilities", "Note", "Session_Note",
+    "Capabilities", "Note", "Session_Note", "Seq_Num",
 ]
 
 # Column layout for the per-IE breakdown file (one row per information element).
@@ -138,6 +138,10 @@ KNOWN_OUIS: dict[str, str] = {
     "44:fb:42": "Tesla, Inc.",
 }
 
+# Protocol markers that do not identify the device manufacturer. 00:50:f2 is
+# commonly carried by WMM/WPS IEs on devices made by many different vendors.
+NON_DEVICE_VENDOR_IE_OUIS = {"00:50:f2"}
+
 # ANSI colour codes
 COLOUR_RESET  = "\033[0m"
 COLOUR_RED    = "\033[91m"
@@ -167,6 +171,7 @@ class Session:
     ssids: set = field(default_factory=set)
     first_ts: float = field(default_factory=time.time)
     last_ts: float = field(default_factory=time.time)
+    last_seq: int | None = None
 
 
 active_sessions: dict[int, Session] = {}
@@ -220,6 +225,16 @@ def calculate_distance(rssi: int) -> float:
         return 0.0
 
 
+def seq_delta(new_seq: int, last_seq: int) -> int:
+    """Forward distance between two 12-bit sequence numbers, wraparound-aware.
+
+    Returns (new_seq - last_seq) mod 4096. Small positive values indicate a
+    plausible same-radio continuation across MAC rotation; this is consumed in
+    Phase 2, not here.
+    """
+    return (new_seq - last_seq) % 4096
+
+
 def proximity_zone(distance_m: float) -> str:
     """Return a coarse room-distance bucket for grouping decisions."""
     if distance_m <= 0:
@@ -271,10 +286,13 @@ def vendor_from_ie_ouis(vendor_ies: str) -> str:
     but the tag-221 elements a device advertises still leak the chipset /
     software-stack vendor. Tries the curated KNOWN_OUIS names first, falls
     back to the full mac_vendor_lookup database, and finally returns the raw
-    OUI list when nothing resolves. Returns "Unknown" when no tag-221 OUIs
-    were present at all.
+    OUI list when nothing resolves. Protocol-only OUIs such as 00:50:f2 are
+    excluded. Returns "Unknown" when no attributable tag-221 OUIs remain.
     """
-    ouis = sorted(_parse_set(vendor_ies))
+    ouis = sorted(
+        {oui.lower() for oui in _parse_set(vendor_ies)}
+        - NON_DEVICE_VENDOR_IE_OUIS
+    )
     if not ouis:
         return "Unknown"
     for oui in ouis:
@@ -464,15 +482,10 @@ def dump_ie_details(pkt, timestamp: str, pkt_type: str, mac_addr: str) -> None:
 
 
 def extract_ssid(pkt, fallback: str) -> str:
-    """Read SSID from packet info or SSID information element."""
-    raw_ssid = getattr(pkt, "info", b"") or b""
-    if not raw_ssid:
-        ssid_el  = pkt.getlayer(Dot11Elt, ID=0)
-        raw_ssid = getattr(ssid_el, "info", b"") if ssid_el else b""
-    try:
-        return raw_ssid.decode("utf-8", errors="ignore") or fallback
-    except AttributeError:
-        return fallback
+    """Read an SSID only from the tag-0 information element."""
+    ssid_el = pkt.getlayer(Dot11Elt, ID=0)
+    raw = getattr(ssid_el, "info", b"") if ssid_el else b""
+    return raw.decode("utf-8", errors="ignore") or fallback
 
 
 def get_correlation_identity(pkt) -> str:
@@ -484,7 +497,6 @@ def get_correlation_identity(pkt) -> str:
     region       = "Unknown"
     device_class = "IoT/Low-End"
     is_apple     = False
-    is_windows   = False
     found_oui    = "None"
 
     try:
@@ -504,13 +516,20 @@ def get_correlation_identity(pkt) -> str:
                 if isinstance(raw_oui, int):
                     oui_str    = oui_int_to_str(raw_oui)
                     found_oui  = oui_str
-                    tag_vendor = lookup_oui(oui_str)
-                    if "Unknown" not in tag_vendor:
-                        vendor = tag_vendor
+                    info = getattr(el, "info", b"") or b""
+                    vendor_type = info[0] if info else None
+                    is_wmm_or_wps = (raw_oui, vendor_type) in {
+                        (0x0050F2, 0x02),
+                        (0x0050F2, 0x04),
+                    }
+                    if not is_wmm_or_wps and not (
+                        raw_oui == 0x0050F2 and vendor_type is None
+                    ):
+                        tag_vendor = lookup_oui(oui_str)
+                        if "Unknown" not in tag_vendor:
+                            vendor = tag_vendor
                     if raw_oui == 0x0017F2:
                         is_apple = True
-                    if raw_oui == 0x0050F2:
-                        is_windows = True
             except Exception:
                 pass
             el = el.payload.getlayer(Dot11EltVendorSpecific)
@@ -524,8 +543,6 @@ def get_correlation_identity(pkt) -> str:
 
     if is_apple:
         return f"Apple Device ({region})"
-    if is_windows:
-        return f"Windows/PC ({vendor})"
     if "Tuya Smart" in vendor or "Espressif" in vendor:
         return f"Smart Home/IoT ({vendor})"
     if vendor != "Generic":
@@ -687,6 +704,7 @@ def _update_session(
     frame_type: str,
     ie_fingerprint: str,
     vendor_ies: set[str],
+    seq: int | None,
     now: float,
 ) -> None:
     """Merge one observation into an existing session."""
@@ -694,6 +712,7 @@ def _update_session(
     _update_rssi_stats(session, power)
     if zone != "unknown":
         session.zone = zone
+    session.last_seq = seq
     session.last_ts = now
     session.all_macs.add(mac)
     session.ssids.update(ssids)
@@ -713,6 +732,7 @@ def track_session(
     ie_fingerprint: str,
     vendor_ies: str,
     mac_type: str,
+    seq: int | None = None,
 ) -> str:
     """
     Match this observation to an existing session or create a new one.
@@ -730,7 +750,7 @@ def track_session(
             if mac in session.all_macs:
                 _update_session(
                     session, mac, power, zone, ssid_set, frame_type,
-                    ie_fingerprint, vendor_ie_set, now
+                    ie_fingerprint, vendor_ie_set, seq, now
                 )
                 return f"Existing-User-{sid}"
 
@@ -754,7 +774,7 @@ def track_session(
                 session     = active_sessions[best_sid]
                 _update_session(
                     session, mac, power, zone, ssid_set, frame_type,
-                    ie_fingerprint, vendor_ie_set, now
+                    ie_fingerprint, vendor_ie_set, seq, now
                 )
                 reason_text = ", ".join(best_reasons) if best_reasons else "matched evidence"
                 log.debug("Merged randomized MAC %s into User-%s: %s", mac, best_sid, reason_text)
@@ -763,6 +783,7 @@ def track_session(
         new_id  = max(active_sessions.keys(), default=0) + 1
         session = Session(
             last_mac        = mac,
+            last_seq        = seq,
             all_macs        = {mac},
             fingerprint     = fingerprint,
             ie_fingerprints = {ie_fingerprint} if ie_fingerprint else set(),
@@ -895,6 +916,12 @@ def handle_packet(pkt) -> None:
     if pkt_type is None or not mac_addr:
         return
 
+    seq = (
+        pkt[Dot11].SC >> 4
+        if pkt.haslayer(Dot11) and pkt[Dot11].SC is not None
+        else None
+    )
+
     ssid = extract_ssid(
         pkt,
         "(Hidden SSID)" if pkt_type == "BEACON" else "(Wildcard)",
@@ -932,7 +959,7 @@ def handle_packet(pkt) -> None:
     if pkt_type in CLIENT_FRAME_TYPES:
         session_note = track_session(
             mac_addr, identity, power, zone, [ssid], pkt_type,
-            ie_details["ie_fingerprint"], ie_details["vendor_ies"], mac_type,
+            ie_details["ie_fingerprint"], ie_details["vendor_ies"], mac_type, seq,
         )
     else:
         session_note = "AP-Logged-Only"
@@ -955,7 +982,7 @@ def handle_packet(pkt) -> None:
         vendor, ssid, channel, band, power, dist_m,
         interval, ie_details["ie_sequence"], ie_details["ie_fingerprint"],
         ie_details["vendor_ies"], ie_details["capabilities"], identity,
-        final_note,
+        final_note, seq,
     ])
 
     dump_ie_details(pkt, timestamp, pkt_type, mac_addr)
