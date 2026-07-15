@@ -68,6 +68,8 @@ CSV_FIELDS = [
     "Vendor", "SSID", "Channel", "Band", "Power_dBm", "Distance_m",
     "Interval_sec", "IE_Sequence", "IE_Fingerprint", "Vendor_IEs",
     "Capabilities", "Note", "Session_Note", "Seq_Num",
+    "Listen_Interval", "Cap_Info", "Current_AP",
+    "Security_Tier", "Auth_Status", "Reason_Code", "Direction",
 ]
 
 # Column layout for the per-IE breakdown file (one row per information element).
@@ -179,6 +181,9 @@ class Session:
     first_ts: float = field(default_factory=time.time)
     last_ts: float = field(default_factory=time.time)
     last_seq: int | None = None
+    current_aps:      set = field(default_factory=set)   # roaming lineage
+    listen_intervals: set = field(default_factory=set)   # OS/driver hint
+    security_tiers:   set = field(default_factory=set)   # Open / FT / WPA3-SAE
 
 
 active_sessions: dict[int, Session] = {}
@@ -557,6 +562,62 @@ def get_correlation_identity(pkt) -> str:
     return f"Unknown Device [OUI:{found_oui}]"
 
 
+def auth_tier(algo: int, tags: set[int]) -> str:
+    """Map auth algorithm (+ present tag IDs) to a security tier. Pure."""
+    if algo == 3:
+        return "WPA3-SAE"
+    if algo == 2:
+        return "FT"
+    if algo == 0:
+        # FT can ride an open-auth frame; Mobility Domain (54) + FTE (55) present
+        return "FT" if {54, 55} & tags else "Open"
+    return f"algo:{algo}"
+
+
+def frame_direction(pkt) -> str:
+    """AP- vs client-originated, from transmitter (addr2) vs BSSID (addr3)."""
+    addr2 = _safe_upper_mac(getattr(pkt, "addr2", None))
+    addr3 = _safe_upper_mac(getattr(pkt, "addr3", None))
+    if not addr2 or not addr3:
+        return "unknown"
+    return "from-AP" if addr2 == addr3 else "from-client"
+
+
+def parse_frame_body(pkt, pkt_type: str) -> dict:
+    """Subtype-specific fixed fields (NOT the seq number — Phase 0 owns that).
+
+    Assoc/Reassoc -> listen interval, capability info, (reassoc) current AP.
+    Auth          -> security tier + status + direction.
+    Deauth/Disas  -> reason code + direction.
+    Real SSID is already correct via extract_ssid() (Phase 0 tag-0 fix), so it
+    is not re-extracted here.
+    """
+    out = {"listen_interval": None, "cap_info": None, "current_ap": None,
+           "security_tier": None, "auth_status": None, "reason": None,
+           "direction": None}
+    try:
+        if pkt_type == "ASSOC_REQ":
+            a = pkt[Dot11AssoReq]
+            out["cap_info"], out["listen_interval"] = int(a.cap), a.listen_interval
+        elif pkt_type == "REASSOC_REQ":
+            r = pkt[Dot11ReassoReq]
+            out["cap_info"], out["listen_interval"] = int(r.cap), r.listen_interval
+            out["current_ap"] = _safe_upper_mac(r.current_AP)
+        elif pkt_type == "AUTH":
+            au = pkt[Dot11Auth]
+            tags = {tag_id for tag_id, _ in _iter_ies(pkt)}
+            out["security_tier"] = auth_tier(au.algo, tags)
+            out["auth_status"]   = au.status
+            out["direction"]     = frame_direction(pkt)
+        elif pkt_type in ("DEAUTH", "DISASSOC"):
+            body = pkt.getlayer(Dot11Deauth) or pkt.getlayer(Dot11Disas)
+            out["reason"]    = getattr(body, "reason", None)
+            out["direction"] = frame_direction(pkt)
+    except Exception:
+        pass  # malformed frame -> keep None fields; never raise into prn
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Session tracking
 # ---------------------------------------------------------------------------
@@ -702,6 +763,21 @@ def _can_merge_randomized_session(
     return support_count >= 2, score, reasons
 
 
+def _store_frame_body_evidence(
+    session: Session,
+    current_ap: str | None,
+    listen_interval: int | None,
+    security_tier: str | None,
+) -> None:
+    """Retain Phase 1 subtype fields on the session (store-only, no scoring)."""
+    if current_ap:
+        session.current_aps.add(current_ap)
+    if listen_interval is not None:
+        session.listen_intervals.add(listen_interval)
+    if security_tier is not None:
+        session.security_tiers.add(security_tier)
+
+
 def _update_session(
     session: Session,
     mac: str,
@@ -713,6 +789,9 @@ def _update_session(
     vendor_ies: set[str],
     seq: int | None,
     now: float,
+    current_ap: str | None = None,
+    listen_interval: int | None = None,
+    security_tier: str | None = None,
 ) -> None:
     """Merge one observation into an existing session."""
     session.last_mac = mac
@@ -727,6 +806,7 @@ def _update_session(
     if ie_fingerprint:
         session.ie_fingerprints.add(ie_fingerprint)
     session.vendor_ies.update(vendor_ies)
+    _store_frame_body_evidence(session, current_ap, listen_interval, security_tier)
 
 
 def track_session(
@@ -740,6 +820,9 @@ def track_session(
     vendor_ies: str,
     mac_type: str,
     seq: int | None = None,
+    current_ap: str | None = None,
+    listen_interval: int | None = None,
+    security_tier: str | None = None,
 ) -> str:
     """
     Match this observation to an existing session or create a new one.
@@ -757,7 +840,8 @@ def track_session(
             if mac in session.all_macs:
                 _update_session(
                     session, mac, power, zone, ssid_set, frame_type,
-                    ie_fingerprint, vendor_ie_set, seq, now
+                    ie_fingerprint, vendor_ie_set, seq, now,
+                    current_ap, listen_interval, security_tier,
                 )
                 return f"Existing-User-{sid}"
 
@@ -781,7 +865,8 @@ def track_session(
                 session     = active_sessions[best_sid]
                 _update_session(
                     session, mac, power, zone, ssid_set, frame_type,
-                    ie_fingerprint, vendor_ie_set, seq, now
+                    ie_fingerprint, vendor_ie_set, seq, now,
+                    current_ap, listen_interval, security_tier,
                 )
                 reason_text = ", ".join(best_reasons) if best_reasons else "matched evidence"
                 log.debug("Merged randomized MAC %s into User-%s: %s", mac, best_sid, reason_text)
@@ -803,6 +888,7 @@ def track_session(
             last_ts         = now,
         )
         _update_rssi_stats(session, power)
+        _store_frame_body_evidence(session, current_ap, listen_interval, security_tier)
         active_sessions[new_id] = session
         return f"New-User-{new_id}"
 
@@ -954,6 +1040,7 @@ def handle_packet(pkt) -> None:
 
     identity     = get_correlation_identity(pkt)
     ie_details   = extract_ie_details(pkt)
+    body         = parse_frame_body(pkt, pkt_type)
 
     # Vendor column: a real (burned-in) MAC has a genuine OUI, so look it up
     # in the vendor database. A randomized MAC has no real OUI to resolve —
@@ -967,6 +1054,7 @@ def handle_packet(pkt) -> None:
         session_note = track_session(
             mac_addr, identity, power, zone, [ssid], pkt_type,
             ie_details["ie_fingerprint"], ie_details["vendor_ies"], mac_type, seq,
+            body["current_ap"], body["listen_interval"], body["security_tier"],
         )
     else:
         session_note = "AP-Logged-Only"
@@ -993,6 +1081,9 @@ def handle_packet(pkt) -> None:
         interval, ie_details["ie_sequence"], ie_details["ie_fingerprint"],
         ie_details["vendor_ies"], ie_details["capabilities"], identity,
         final_note, seq,
+        body["listen_interval"], body["cap_info"], body["current_ap"],
+        body["security_tier"], body["auth_status"], body["reason"],
+        body["direction"],
     ])
 
     dump_ie_details(pkt, timestamp, pkt_type, mac_addr)

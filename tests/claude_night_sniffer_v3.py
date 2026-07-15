@@ -180,6 +180,37 @@ class SequenceDeltaTests(unittest.TestCase):
         self.assertEqual(ns.seq_delta(1234, 1234), 0)
 
 
+class AuthTierTests(unittest.TestCase):
+    def test_sae_algorithm(self):
+        self.assertEqual(ns.auth_tier(3, set()), "WPA3-SAE")
+
+    def test_ft_algorithm(self):
+        self.assertEqual(ns.auth_tier(2, set()), "FT")
+
+    def test_open_auth_with_ft_tags_is_ft(self):
+        self.assertEqual(ns.auth_tier(0, {54, 55}), "FT")
+
+    def test_open_auth_without_ft_tags_is_open(self):
+        self.assertEqual(ns.auth_tier(0, set()), "Open")
+
+    def test_unknown_algorithm_is_labelled(self):
+        self.assertEqual(ns.auth_tier(1, set()), "algo:1")
+
+
+class FrameDirectionTests(unittest.TestCase):
+    def test_equal_addr2_addr3_is_from_ap(self):
+        pkt = FakePacket(addr2="aa:bb:cc:dd:ee:ff", addr3="aa:bb:cc:dd:ee:ff")
+        self.assertEqual(ns.frame_direction(pkt), "from-AP")
+
+    def test_different_addr2_addr3_is_from_client(self):
+        pkt = FakePacket(addr2="11:22:33:44:55:66", addr3="aa:bb:cc:dd:ee:ff")
+        self.assertEqual(ns.frame_direction(pkt), "from-client")
+
+    def test_missing_address_is_unknown(self):
+        self.assertEqual(ns.frame_direction(FakePacket(addr2="aa:bb:cc:dd:ee:ff")), "unknown")
+        self.assertEqual(ns.frame_direction(FakePacket()), "unknown")
+
+
 class MacHelperTests(unittest.TestCase):
     def test_locally_administered_bit_means_randomized(self):
         self.assertEqual(ns.check_mac_type("02:11:22:33:44:55"), "Randomized")
@@ -487,7 +518,9 @@ class CsvSetupTests(unittest.TestCase):
             with open(self.tmp_file, newline="") as fh:
                 rows = list(csv.reader(fh))
         self.assertEqual(rows, [ns.CSV_FIELDS])
-        self.assertEqual(ns.CSV_FIELDS[-1], "Seq_Num")
+        # Phase 1 appended the frame-body columns after Seq_Num.
+        self.assertEqual(ns.CSV_FIELDS[-8], "Seq_Num")
+        self.assertEqual(ns.CSV_FIELDS[-1], "Direction")
 
     def test_setup_csv_does_not_clobber_existing_file(self):
         self.tmp_file.write_text("not,a,header\n1,2,3\n")

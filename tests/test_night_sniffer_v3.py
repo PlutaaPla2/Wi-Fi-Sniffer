@@ -168,7 +168,7 @@ class NightSnifferV3IeTests(unittest.TestCase):
 
 
 class NightSnifferV3PacketHandlerTests(unittest.TestCase):
-    def test_sequence_number_reaches_session_and_final_csv_column(self):
+    def test_sequence_number_reaches_session_and_csv_seq_column(self):
         class FakePacket:
             dot11 = types.SimpleNamespace(SC=(321 << 4) | 7)
 
@@ -203,8 +203,15 @@ class NightSnifferV3PacketHandlerTests(unittest.TestCase):
         ), patch("builtins.print"):
             night_sniffer_v3.handle_packet(FakePacket())
 
-        self.assertEqual(track_session.call_args.args[-1], 321)
-        self.assertEqual(append_row.call_args.args[0][-1], 321)
+        # seq is passed to track_session as the 10th positional arg (index 9);
+        # Phase 1 appends current_ap/listen_interval/security_tier after it.
+        self.assertEqual(track_session.call_args.args[9], 321)
+        # In the CSV row seq sits at the Seq_Num column, before the seven
+        # Phase 1 frame-body columns, i.e. 8th from the end.
+        self.assertEqual(append_row.call_args.args[0][-8], 321)
+        self.assertEqual(
+            night_sniffer_v3.CSV_FIELDS[-8], "Seq_Num"
+        )
 
 
 if __name__ == "__main__":
