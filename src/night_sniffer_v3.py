@@ -5,6 +5,7 @@ Passively captures and fingerprints WiFi clients and access points.
 """
 
 import os
+import sys
 import time
 import threading
 import csv
@@ -27,6 +28,8 @@ from mac_vendor_lookup import MacLookup
 # Configuration
 # ---------------------------------------------------------------------------
 
+# Default capture interface. Overridable per run with --iface, or via the
+# startup prompt when that flag is omitted and stdin is a terminal.
 INTERFACE          = "wlan1"
 
 # ── Output file paths (edit these to change where CSVs are written) ──────────
@@ -44,6 +47,43 @@ AUTO_SAVE_INTERVAL = 60     # Seconds between auto-save of session summary
 GROUP_SCORE_THRESHOLD      = 6
 OVERLAP_TOLERANCE_SECONDS  = 5
 CHANNEL_HOP_INTERVAL       = 0.5
+
+# ── Capture mode / channel plan ──────────────────────────────────────────────
+# These are the defaults used when the matching CLI flag is not supplied AND
+# the interactive prompt is skipped (stdin is not a terminal, e.g. nohup/cron).
+# Edit them to change what a bare `sudo python3 night_sniffer_v3.py` does.
+DEFAULT_CAPTURE_MODE = "hop"    # "camp" = stay on one channel, "hop" = rotate
+DEFAULT_BAND         = "2.4"    # "2.4" | "5" | "both" — hop mode only
+DEFAULT_CAMP_CHANNEL = 6        # camp mode only
+
+CAPTURE_MODES = ("camp", "hop")
+BANDS         = ("2.4", "5", "both")
+
+# 2.4 GHz hop range. Channel 14 is Japan-only and deliberately omitted.
+CHANNELS_2GHZ: list[int] = list(range(1, 14))
+
+# 5 GHz hop range — the full regulatory set. Channels 52–144 are DFS
+# (radar-shared spectrum). This tool only ever listens and never transmits, so
+# the DFS obligation itself does not apply to us, but the kernel still marks
+# those channels RADAR/NO-IR and some driver + regulatory-domain combinations
+# refuse to tune there anyway. PROBE_HOP_CHANNELS below tests every channel
+# once at startup and drops the refusals, so this list never needs hand-
+# trimming per adapter or per country.
+CHANNELS_5GHZ: list[int] = [
+    36, 40, 44, 48,                          # UNII-1  — non-DFS
+    52, 56, 60, 64,                          # UNII-2A — DFS
+    100, 104, 108, 112, 116,                 # UNII-2C — DFS
+    120, 124, 128,                           # UNII-2C — DFS, weather radar
+    132, 136, 140, 144,                      # UNII-2C — DFS
+    149, 153, 157, 161, 165,                 # UNII-3  — non-DFS
+]
+
+# Tune each channel once before hopping starts and keep only the ones the
+# driver accepts. Costs PROBE_SETTLE seconds per channel at startup, and saves
+# the hopper from burning a full CHANNEL_HOP_INTERVAL dwell on a dead channel
+# on every single sweep, forever. Set False to trust the lists above verbatim.
+PROBE_HOP_CHANNELS = True
+PROBE_SETTLE       = 0.05   # Seconds to let the driver settle between probes
 
 # ── Interface recovery ────────────────────────────────────────────────────────
 # When sniff() exits unexpectedly (the adapter drops out of monitor mode),
@@ -371,6 +411,105 @@ def reset_monitor_mode(iface: str) -> None:
         if result.returncode != 0:
             log.warning("  cmd %s failed: %s", " ".join(cmd), result.stderr.strip())
     time.sleep(1)
+
+
+# ---------------------------------------------------------------------------
+# Channel control
+# ---------------------------------------------------------------------------
+
+def set_channel(iface: str, channel: int, quiet: bool = False) -> bool:
+    """
+    Tune ``iface`` to ``channel`` and report whether the driver accepted it.
+
+    Purely receive-side configuration — retuning the radio transmits nothing,
+    so this stays inside the passive-capture constraint.
+
+    ``quiet`` suppresses the per-failure warning; probe_channels() sets it so
+    that testing 38 channels does not produce 38 warning lines.
+    """
+    result = subprocess.run(
+        ["iw", "dev", iface, "set", "channel", str(channel)],
+        check=False,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    if result.returncode != 0:
+        if not quiet:
+            log.warning("Channel set to %s failed: %s", channel, result.stderr.strip())
+        return False
+    return True
+
+
+def _channel_band_label(channel: int) -> str:
+    """
+    Name the band a channel number belongs to, for logging and camp validation.
+
+    Resolved against the configured lists rather than hardcoded ranges, so
+    trimming CHANNELS_5GHZ is reflected here too.
+    """
+    if channel in CHANNELS_2GHZ:
+        return "2.4GHz"
+    if channel in CHANNELS_5GHZ:
+        return "5GHz"
+    return "unknown"
+
+
+def build_hop_channels(band: str) -> list[int]:
+    """
+    Return the ordered channel list the hopper rotates through for ``band``.
+
+    "both" is a single concatenated rotation walked by the one hopper thread —
+    not two threads and not an alternating interleave. That keeps the dwell
+    behaviour identical to a single-band sweep, at the cost of a proportionally
+    longer revisit time for any individual channel.
+    """
+    if band == "2.4":
+        return list(CHANNELS_2GHZ)
+    if band == "5":
+        return list(CHANNELS_5GHZ)
+    if band == "both":
+        return list(CHANNELS_2GHZ) + list(CHANNELS_5GHZ)
+    raise ValueError(f"Unknown band: {band!r} (expected one of {BANDS})")
+
+
+def probe_channels(iface: str, channels: list[int]) -> list[int]:
+    """
+    Return the subset of ``channels`` this adapter + regulatory domain accepts.
+
+    Each channel is tuned once and the return code checked. Anything the driver
+    refuses — most often DFS/no-IR channels, sometimes 12/13 under a US
+    regdomain — is dropped so the hopper never wastes a dwell slot on it.
+
+    If nothing at all is tunable the interface is almost certainly not in
+    monitor mode, so we say so loudly and hand back the original list rather
+    than leaving the caller with an empty rotation.
+    """
+    log.info("Probing %d channel(s) on %s for tunability …", len(channels), iface)
+    usable:  list[int] = []
+    refused: list[int] = []
+    for channel in channels:
+        if set_channel(iface, channel, quiet=True):
+            usable.append(channel)
+        else:
+            refused.append(channel)
+        time.sleep(PROBE_SETTLE)
+
+    if not usable:
+        log.error("No channels are tunable on %s — is it in monitor mode and up?", iface)
+        log.error(
+            "  sudo ip link set %s down && sudo iw dev %s set type monitor "
+            "&& sudo ip link set %s up", iface, iface, iface,
+        )
+        log.warning("Falling back to the unverified channel list.")
+        return list(channels)
+
+    log.info("  usable  (%d): %s", len(usable), ",".join(str(c) for c in usable))
+    if refused:
+        log.warning(
+            "  refused (%d): %s", len(refused), ",".join(str(c) for c in refused)
+        )
+    return usable
 
 
 # ---------------------------------------------------------------------------
@@ -1093,20 +1232,25 @@ def handle_packet(pkt) -> None:
 # Background threads
 # ---------------------------------------------------------------------------
 
-def channel_hopper() -> None:
-    """Rotate through channels 1–13 continuously."""
-    log.info("Channel hopper started on %s", INTERFACE)
+def channel_hopper(iface: str, channels: list[int]) -> None:
+    """
+    Rotate ``iface`` through ``channels`` continuously, dwelling on each one
+    for CHANNEL_HOP_INTERVAL seconds.
+
+    The list is built by build_hop_channels() from the selected band and, when
+    PROBE_HOP_CHANNELS is on, already filtered down to channels this adapter
+    accepts. Because every pass re-issues the channel set, hop mode also
+    self-heals after a monitor-mode reset — unlike camp mode, which has to be
+    re-applied explicitly.
+    """
+    sweep = len(channels) * CHANNEL_HOP_INTERVAL
+    log.info(
+        "Channel hopper started on %s — %d channels, %.1fs per sweep",
+        iface, len(channels), sweep,
+    )
     while True:
-        for ch in range(1, 14):
-            result = subprocess.run(
-                ["iw", "dev", INTERFACE, "set", "channel", str(ch)],
-                check=False,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.PIPE,
-                text=True,
-            )
-            if result.returncode != 0:
-                log.warning("Channel hop to %s failed: %s", ch, result.stderr.strip())
+        for ch in channels:
+            set_channel(iface, ch)
             time.sleep(CHANNEL_HOP_INTERVAL)
 
 
@@ -1119,15 +1263,151 @@ def auto_report_worker() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Startup prompts
+# ---------------------------------------------------------------------------
+# Every setting below is also reachable as a CLI flag. The flag always wins;
+# these prompts only run for the settings whose flag was omitted, and only when
+# stdin is a terminal — an unattended run falls straight through to the
+# DEFAULT_* constants instead of blocking forever on input().
+
+def _stdin_is_interactive() -> bool:
+    """True when startup prompts can be shown (stdin is a real terminal)."""
+    try:
+        return sys.stdin is not None and sys.stdin.isatty()
+    except (AttributeError, ValueError):
+        # Detached or already-closed stdin: treat as non-interactive.
+        return False
+
+
+def _ask(question: str, default: str) -> str:
+    """Read one line, returning ``default`` on a bare Enter or closed stdin."""
+    try:
+        answer = input(f"{question} [{default}]: ").strip()
+    except EOFError:
+        # stdin vanished mid-prompt — fall back rather than kill the run.
+        print()
+        return default
+    except KeyboardInterrupt:
+        print()
+        raise SystemExit("Cancelled at startup prompt.")
+    return answer or default
+
+
+def prompt_choice(title: str, options: list[tuple[str, str]], default_key: str) -> str:
+    """
+    Ask the user to pick one of ``options``, a list of ``(key, label)`` pairs.
+
+    Accepts either the 1-based menu number or the key itself, and a bare Enter
+    takes ``default_key``. Re-asks until the answer is valid.
+    """
+    while True:
+        print(f"\n{title}")
+        for index, (key, label) in enumerate(options, start=1):
+            marker = "   <- default" if key == default_key else ""
+            print(f"  [{index}] {label}{marker}")
+        answer = _ask("Choice", default_key).lower()
+        for index, (key, _label) in enumerate(options, start=1):
+            if answer in (key, str(index)):
+                return key
+        print(f"  '{answer}' is not one of the choices — try again.")
+
+
+def prompt_interface() -> str:
+    """Ask which adapter to capture on."""
+    print()
+    return _ask("Capture interface", INTERFACE)
+
+
+def prompt_capture_mode() -> str:
+    """Ask whether to sit on a single channel or rotate through a band."""
+    return prompt_choice(
+        "Capture mode:",
+        [
+            ("camp", "Camp on one channel"),
+            ("hop",  "Hop across a band"),
+        ],
+        DEFAULT_CAPTURE_MODE,
+    )
+
+
+def prompt_band() -> str:
+    """Ask which channel range the hopper should sweep."""
+    count_2ghz = len(CHANNELS_2GHZ)
+    count_5ghz = len(CHANNELS_5GHZ)
+    return prompt_choice(
+        "Band to hop:",
+        [
+            ("2.4",  f"2.4 GHz  ({count_2ghz} channels, "
+                     f"{count_2ghz * CHANNEL_HOP_INTERVAL:.1f}s sweep)"),
+            ("5",    f"5 GHz    ({count_5ghz} channels before DFS probe, "
+                     f"{count_5ghz * CHANNEL_HOP_INTERVAL:.1f}s sweep)"),
+            ("both", f"Both     ({count_2ghz + count_5ghz} channels, "
+                     f"{(count_2ghz + count_5ghz) * CHANNEL_HOP_INTERVAL:.1f}s sweep)"),
+        ],
+        DEFAULT_BAND,
+    )
+
+
+def prompt_camp_channel() -> int:
+    """Ask which single channel to camp on, re-asking until it parses."""
+    while True:
+        print()
+        answer = _ask("Channel to camp on", str(DEFAULT_CAMP_CHANNEL))
+        try:
+            channel = int(answer)
+        except ValueError:
+            print(f"  '{answer}' is not a number — try again.")
+            continue
+        if channel <= 0:
+            print("  Channel must be a positive number — try again.")
+            continue
+        if _channel_band_label(channel) == "unknown":
+            # Outside the configured lists, but the driver is the real
+            # authority here — let it through and let set_channel() rule on it.
+            print(f"  Note: channel {channel} is outside the configured "
+                  f"2.4/5 GHz lists.")
+        return channel
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Passive Wi-Fi reconnaissance capture.")
     parser.add_argument(
+        "--iface",
+        default=None,
+        help="Capture interface. Prompted for when omitted; falls back to "
+             f"'{INTERFACE}' when stdin is not a terminal.",
+    )
+    parser.add_argument(
+        "--mode",
+        choices=CAPTURE_MODES,
+        default=None,
+        help="Capture mode: 'camp' stays on a single channel, 'hop' rotates "
+             "through a band. Prompted for when omitted; falls back to "
+             f"'{DEFAULT_CAPTURE_MODE}' when stdin is not a terminal.",
+    )
+    parser.add_argument(
+        "--band",
+        choices=BANDS,
+        default=None,
+        help="Channel range to hop, hop mode only: '2.4', '5', or 'both' for "
+             "one continuous sweep across the two. Prompted for when omitted; "
+             f"falls back to '{DEFAULT_BAND}' when stdin is not a terminal.",
+    )
+    parser.add_argument(
+        "--channel",
+        type=int,
+        default=None,
+        help="Channel to camp on, camp mode only. Prompted for when omitted; "
+             f"falls back to {DEFAULT_CAMP_CHANNEL} when stdin is not a terminal.",
+    )
+    parser.add_argument(
         "--hop",
         action="store_true",
-        help="Enable active channel hopping with iw. Disabled by default.",
+        help="Backwards-compatible alias for --mode hop.",
     )
     parser.add_argument(
         "--frames",
@@ -1139,17 +1419,78 @@ def main() -> None:
     )
     args = parser.parse_args()
 
+    if args.hop and args.mode == "camp":
+        parser.error("--hop contradicts --mode camp; pass only one of them.")
+
     global TERMINAL_FRAME_FILTER
     TERMINAL_FRAME_FILTER = args.frames
+
+    # ── Settings resolution ──────────────────────────────────────────────────
+    # For each setting: the CLI flag wins, otherwise ask if there is a terminal
+    # to ask on, otherwise fall back to the module-level DEFAULT_* constant so
+    # unattended runs never block on input().
+    interactive = _stdin_is_interactive()
+    if not interactive:
+        log.info("stdin is not a terminal — skipping startup prompts, "
+                 "using CLI flags and code defaults.")
+
+    iface = args.iface or (prompt_interface() if interactive else INTERFACE)
+
+    if args.mode:
+        mode = args.mode
+    elif args.hop:
+        mode = "hop"
+    elif interactive:
+        mode = prompt_capture_mode()
+    else:
+        mode = DEFAULT_CAPTURE_MODE
+
+    camp_channel: int | None = None
+    band:         str | None = None
+    hop_channels: list[int]  = []
+
+    if mode == "camp":
+        if args.band:
+            log.warning("--band is ignored in camp mode.")
+        camp_channel = (
+            args.channel if args.channel is not None
+            else (prompt_camp_channel() if interactive else DEFAULT_CAMP_CHANNEL)
+        )
+    else:
+        if args.channel is not None:
+            log.warning("--channel is ignored in hop mode.")
+        band = args.band or (prompt_band() if interactive else DEFAULT_BAND)
+        hop_channels = build_hop_channels(band)
 
     setup_csv()
     setup_ie_csv()
 
-    log.info("Starting WiFi Recon on interface: %s", INTERFACE)
+    log.info("Starting WiFi Recon on interface: %s", iface)
     log.info("Logging packets to            : %s", LOG_FILE)
     log.info("Logging IE breakdown to       : %s", IE_DETAILS_FILE)
     log.info("Max reconnect attempts        : %d", MAX_RETRIES)
     log.info("Terminal frame filter         : %s", TERMINAL_FRAME_FILTER)
+    log.info("Capture mode                  : %s", mode)
+
+    # ── Apply the channel plan ───────────────────────────────────────────────
+    if mode == "camp":
+        log.info("Camped channel                : %d (%s)",
+                 camp_channel, _channel_band_label(camp_channel))
+        if not set_channel(iface, camp_channel):
+            # Camping on a channel the driver refused would silently capture
+            # whatever the radio happened to be tuned to, which is worse than
+            # stopping — so bail out with the fix spelled out.
+            log.error("Could not tune %s to channel %d.", iface, camp_channel)
+            log.error("Check the adapter is in monitor mode and up:")
+            log.error("  sudo ip link set %s down && sudo iw dev %s set type "
+                      "monitor && sudo ip link set %s up", iface, iface, iface)
+            raise SystemExit(1)
+    else:
+        if PROBE_HOP_CHANNELS:
+            hop_channels = probe_channels(iface, hop_channels)
+        log.info("Hop band                      : %s", band)
+        log.info("Hop channels                  : %d (%.1fs per sweep)",
+                 len(hop_channels), len(hop_channels) * CHANNEL_HOP_INTERVAL)
 
     sep = "-" * 110
     print(sep)
@@ -1157,11 +1498,24 @@ def main() -> None:
           f"{'Pwr':>4} | {'Dist':>5} | SSID")
     print(sep)
 
-    if args.hop:
-        threading.Thread(target=channel_hopper, daemon=True).start()
-    else:
-        log.info("Channel hopping disabled — use --hop to rotate channels.")
+    if mode == "hop":
+        threading.Thread(
+            target=channel_hopper, args=(iface, hop_channels), daemon=True
+        ).start()
     threading.Thread(target=auto_report_worker, daemon=True).start()
+
+    def recover_interface() -> None:
+        """
+        Reset monitor mode, then restore the channel plan on top of it.
+
+        A monitor-mode reset drops the radio back to the driver's default
+        channel. The hopper re-issues its channel every CHANNEL_HOP_INTERVAL
+        so it heals itself, but a camped channel would otherwise be silently
+        lost and the rest of the run would capture the wrong channel.
+        """
+        reset_monitor_mode(iface)
+        if mode == "camp" and not set_channel(iface, camp_channel):
+            log.error("Could not re-camp on channel %d after reset.", camp_channel)
 
     # ── Capture loop with automatic interface recovery ────────────────────────
     # sniff() exits silently (returns normally without raising) when the adapter
@@ -1174,7 +1528,7 @@ def main() -> None:
     try:
         while True:
             try:
-                sniff(iface=INTERFACE, prn=handle_packet, store=False)
+                sniff(iface=iface, prn=handle_packet, store=False)
 
                 # sniff() returned without an exception — adapter likely dropped.
                 retry_count += 1
@@ -1188,7 +1542,7 @@ def main() -> None:
                     retry_count, MAX_RETRIES, RETRY_DELAY,
                 )
                 time.sleep(RETRY_DELAY)
-                reset_monitor_mode(INTERFACE)
+                recover_interface()
 
             except OSError as exc:
                 # Some adapter failures raise here instead of returning silently.
@@ -1201,7 +1555,7 @@ def main() -> None:
                     exc, retry_count, MAX_RETRIES, RETRY_DELAY,
                 )
                 time.sleep(RETRY_DELAY)
-                reset_monitor_mode(INTERFACE)
+                recover_interface()
 
     except KeyboardInterrupt:
         log.info("Interrupted – saving final session report …")

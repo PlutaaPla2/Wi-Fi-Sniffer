@@ -696,5 +696,215 @@ class ResetMonitorModeTests(unittest.TestCase):
             ns.reset_monitor_mode("wlan1")  # should not raise despite failures
 
 
+# ---------------------------------------------------------------------------
+# Channel control
+# ---------------------------------------------------------------------------
+
+class SetChannelTests(unittest.TestCase):
+    def test_issues_iw_set_channel_and_reports_success(self):
+        with patch.object(ns.subprocess, "run") as mock_run:
+            mock_run.return_value = types.SimpleNamespace(returncode=0, stderr="")
+            self.assertTrue(ns.set_channel("wlan1", 36))
+
+        self.assertEqual(
+            mock_run.call_args.args[0],
+            ["iw", "dev", "wlan1", "set", "channel", "36"],
+        )
+
+    def test_driver_refusal_reports_failure(self):
+        # What a DFS/no-IR rejection looks like coming back from iw.
+        with patch.object(ns.subprocess, "run") as mock_run, \
+             patch.object(ns.log, "warning"):
+            mock_run.return_value = types.SimpleNamespace(
+                returncode=-22, stderr="command failed: Invalid argument (-22)"
+            )
+            self.assertFalse(ns.set_channel("wlan1", 120))
+
+    def test_quiet_suppresses_the_per_failure_warning(self):
+        with patch.object(ns.subprocess, "run") as mock_run, \
+             patch.object(ns.log, "warning") as mock_warning:
+            mock_run.return_value = types.SimpleNamespace(returncode=1, stderr="nope")
+            self.assertFalse(ns.set_channel("wlan1", 120, quiet=True))
+
+        mock_warning.assert_not_called()
+
+
+class ChannelBandLabelTests(unittest.TestCase):
+    def test_labels_channels_from_the_configured_lists(self):
+        self.assertEqual(ns._channel_band_label(6), "2.4GHz")
+        self.assertEqual(ns._channel_band_label(36), "5GHz")
+        self.assertEqual(ns._channel_band_label(165), "5GHz")
+
+    def test_channel_outside_the_configured_lists_is_unknown(self):
+        self.assertEqual(ns._channel_band_label(14), "unknown")  # Japan-only
+        self.assertEqual(ns._channel_band_label(999), "unknown")
+
+
+class BuildHopChannelsTests(unittest.TestCase):
+    def test_each_band_maps_to_its_configured_list(self):
+        self.assertEqual(ns.build_hop_channels("2.4"), ns.CHANNELS_2GHZ)
+        self.assertEqual(ns.build_hop_channels("5"), ns.CHANNELS_5GHZ)
+
+    def test_both_is_one_concatenated_sweep_not_an_interleave(self):
+        self.assertEqual(
+            ns.build_hop_channels("both"),
+            ns.CHANNELS_2GHZ + ns.CHANNELS_5GHZ,
+        )
+
+    def test_returns_a_copy_so_callers_cannot_mutate_the_config(self):
+        channels = ns.build_hop_channels("2.4")
+        channels.append(99)
+        self.assertNotIn(99, ns.CHANNELS_2GHZ)
+
+    def test_24ghz_range_is_1_to_13(self):
+        # Channel 14 is Japan-only and deliberately excluded.
+        self.assertEqual(ns.CHANNELS_2GHZ, list(range(1, 14)))
+
+    def test_unknown_band_raises(self):
+        with self.assertRaises(ValueError):
+            ns.build_hop_channels("6")
+
+
+class ProbeChannelsTests(unittest.TestCase):
+    def test_drops_the_channels_the_driver_refuses(self):
+        refused = {120, 124, 128}
+        with patch.object(
+            ns, "set_channel", side_effect=lambda i, c, quiet=False: c not in refused
+        ), patch.object(ns.time, "sleep"), patch.object(ns.log, "warning"):
+            usable = ns.probe_channels("wlan1", [36, 120, 124, 128, 149])
+
+        self.assertEqual(usable, [36, 149])
+
+    def test_probes_quietly_so_refusals_do_not_spam_warnings(self):
+        with patch.object(ns, "set_channel", return_value=True) as mock_set, \
+             patch.object(ns.time, "sleep"):
+            ns.probe_channels("wlan1", [36])
+
+        self.assertTrue(mock_set.call_args.kwargs.get("quiet"))
+
+    def test_nothing_tunable_falls_back_to_the_unverified_list(self):
+        # Almost always means the interface is not in monitor mode; returning
+        # an empty rotation would leave the hopper with nothing to do.
+        requested = [36, 40, 44]
+        with patch.object(ns, "set_channel", return_value=False), \
+             patch.object(ns.time, "sleep"), \
+             patch.object(ns.log, "error") as mock_error, \
+             patch.object(ns.log, "warning"):
+            usable = ns.probe_channels("wlan1", requested)
+
+        self.assertEqual(usable, requested)
+        self.assertTrue(mock_error.called)
+
+
+class ChannelHopperTests(unittest.TestCase):
+    def test_walks_the_supplied_list_in_order_dwelling_on_each(self):
+        class StopLoop(Exception):
+            """Breaks the hopper's infinite while-loop from inside sleep()."""
+
+        visited: list[int] = []
+        sleeps: list[float] = []
+
+        def fake_sleep(seconds):
+            sleeps.append(seconds)
+            if len(sleeps) == 3:
+                raise StopLoop
+
+        with patch.object(
+            ns, "set_channel", side_effect=lambda i, c: visited.append(c)
+        ), patch.object(ns.time, "sleep", fake_sleep), patch.object(ns.log, "info"):
+            with self.assertRaises(StopLoop):
+                ns.channel_hopper("wlan1", [36, 40, 44, 48])
+
+        self.assertEqual(visited, [36, 40, 44])
+        self.assertEqual(sleeps, [ns.CHANNEL_HOP_INTERVAL] * 3)
+
+
+# ---------------------------------------------------------------------------
+# Startup prompts
+# ---------------------------------------------------------------------------
+
+class StdinInteractiveTests(unittest.TestCase):
+    def test_terminal_stdin_is_interactive(self):
+        with patch.object(ns.sys, "stdin", types.SimpleNamespace(isatty=lambda: True)):
+            self.assertTrue(ns._stdin_is_interactive())
+
+    def test_piped_stdin_is_not_interactive(self):
+        with patch.object(ns.sys, "stdin", types.SimpleNamespace(isatty=lambda: False)):
+            self.assertFalse(ns._stdin_is_interactive())
+
+    def test_detached_stdin_is_not_interactive(self):
+        with patch.object(ns.sys, "stdin", None):
+            self.assertFalse(ns._stdin_is_interactive())
+
+    def test_closed_stdin_is_not_interactive(self):
+        def closed():
+            raise ValueError("I/O operation on closed file")
+
+        with patch.object(ns.sys, "stdin", types.SimpleNamespace(isatty=closed)):
+            self.assertFalse(ns._stdin_is_interactive())
+
+
+class PromptChoiceTests(unittest.TestCase):
+    OPTIONS = [("camp", "Camp on one channel"), ("hop", "Hop across a band")]
+
+    def test_bare_enter_takes_the_default(self):
+        with patch("builtins.input", return_value=""), patch("builtins.print"):
+            self.assertEqual(ns.prompt_choice("t", self.OPTIONS, "hop"), "hop")
+
+    def test_accepts_the_menu_number(self):
+        with patch("builtins.input", return_value="1"), patch("builtins.print"):
+            self.assertEqual(ns.prompt_choice("t", self.OPTIONS, "hop"), "camp")
+
+    def test_accepts_the_key_itself_case_insensitively(self):
+        with patch("builtins.input", return_value="CAMP"), patch("builtins.print"):
+            self.assertEqual(ns.prompt_choice("t", self.OPTIONS, "hop"), "camp")
+
+    def test_reasks_until_the_answer_is_valid(self):
+        with patch("builtins.input", side_effect=["nope", "2"]), patch("builtins.print"):
+            self.assertEqual(ns.prompt_choice("t", self.OPTIONS, "camp"), "hop")
+
+    def test_closed_stdin_mid_prompt_falls_back_to_the_default(self):
+        with patch("builtins.input", side_effect=EOFError), patch("builtins.print"):
+            self.assertEqual(ns.prompt_choice("t", self.OPTIONS, "hop"), "hop")
+
+    def test_ctrl_c_at_the_prompt_exits_cleanly(self):
+        with patch("builtins.input", side_effect=KeyboardInterrupt), \
+             patch("builtins.print"):
+            with self.assertRaises(SystemExit):
+                ns.prompt_choice("t", self.OPTIONS, "hop")
+
+
+class PromptCampChannelTests(unittest.TestCase):
+    def test_parses_a_channel_number(self):
+        with patch("builtins.input", return_value="149"), patch("builtins.print"):
+            self.assertEqual(ns.prompt_camp_channel(), 149)
+
+    def test_bare_enter_takes_the_configured_default(self):
+        with patch("builtins.input", return_value=""), patch("builtins.print"):
+            self.assertEqual(ns.prompt_camp_channel(), ns.DEFAULT_CAMP_CHANNEL)
+
+    def test_reasks_on_non_numeric_and_non_positive_input(self):
+        with patch("builtins.input", side_effect=["abc", "0", "-4", "36"]), \
+             patch("builtins.print"):
+            self.assertEqual(ns.prompt_camp_channel(), 36)
+
+    def test_channel_outside_the_configured_lists_is_still_accepted(self):
+        # The driver is the real authority; the prompt only notes it.
+        with patch("builtins.input", return_value="14"), patch("builtins.print"):
+            self.assertEqual(ns.prompt_camp_channel(), 14)
+
+
+class PromptDefaultsTests(unittest.TestCase):
+    def test_mode_and_band_prompts_default_to_the_module_constants(self):
+        with patch("builtins.input", return_value=""), patch("builtins.print"):
+            self.assertEqual(ns.prompt_capture_mode(), ns.DEFAULT_CAPTURE_MODE)
+            self.assertEqual(ns.prompt_band(), ns.DEFAULT_BAND)
+            self.assertEqual(ns.prompt_interface(), ns.INTERFACE)
+
+    def test_configured_defaults_are_valid_choices(self):
+        self.assertIn(ns.DEFAULT_CAPTURE_MODE, ns.CAPTURE_MODES)
+        self.assertIn(ns.DEFAULT_BAND, ns.BANDS)
+
+
 if __name__ == "__main__":
     unittest.main()
