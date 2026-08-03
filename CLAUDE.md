@@ -67,7 +67,7 @@ sign-off before you write code**.
   scoped to the file/branch under discussion to avoid merge conflicts.
 
 ### Work log
-- After completing each task, append a short entry to `explanation/CLAUDE_LOG.md` in the
+- After completing each task, append a short entry to `CLAUDE_LOG.md` in the
   project root. Create the file if it does not exist.
 - Log format: follows the format inside what you see in CLAUDE_LOG.md
 - Never delete or rewrite existing log entries; append only.
