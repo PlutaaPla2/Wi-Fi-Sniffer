@@ -111,3 +111,36 @@ Track changes Claude makes to the Wi-Fi Sniffer project, in the same style as `T
 - Captures the five "Suggestions / Issues noticed" items raised alongside the band-selection change above, each with file:line grounding, why it matters, and what the fix would look like: stale `CLAUDE.md:33-34` Commands section, the loss of a "leave the channel as-is" mode, the missing 6 GHz branch in `_freq_to_channel()`, CWD-relative output paths versus the `__file__`-anchored convention, and uniform dwell time hurting probe-request capture on the longer "both" sweep.
 - Also records two non-issues for future reference: why shipping the full DFS list is only safe while `PROBE_HOP_CHANNELS` is on (and what to trim if it is ever turned off), and confirmation that `iw set channel` is receive-side only so the passive constraint is intact.
 - None of the five were fixed — each is either out of scope for the task that was asked, or a decision for the human.
+
+## 2026-08-04 (written 16:10) Documented every flag, prompt, and default
+
+- Created `explanation/20260804_1610_flags_and_options.md` — documentation only, no source code changed.
+- Full inventory of `src/night_sniffer_v3.py` startup surface: six CLI flags (`--iface`, `--mode`, `--band`, `--channel`, `--hop`, `--frames`) plus argparse's `-h/--help`, and the four interactive prompts (interface, capture mode, band, camp channel).
+- Leads with the resolution rule that explains the whole design — **CLI flag → prompt if stdin is a TTY → `DEFAULT_*` constant**, applied per setting independently — and records that `--frames` is the sole exception, having a real argparse default (`"all"`) and therefore no prompt and no `DEFAULT_*` constant.
+- Per flag: argparse default vs effective default, choices, whether it prompts, mode applicability, and validation. Records the three interaction rules: `--hop` with `--mode camp` is a `parser.error`, `--band` is ignored in camp mode, `--channel` is ignored in hop mode.
+- Per prompt: literal on-screen text, the default shown in brackets, accepted answers (key or 1-based menu number, lowercased), and the shared `_ask` behaviour — bare Enter takes the default, `EOFError` falls back, Ctrl+C raises `SystemExit("Cancelled at startup prompt.")`. Only `prompt_camp_channel()` validates; the flag path for `--channel` does not, which is noted.
+- Tabulates band expansion (2.4 → 13 ch / 6.5 s, 5 → 25 ch / 12.5 s, both → 38 ch / 19.0 s at the current `CHANNEL_HOP_INTERVAL`), flagged as pre-probe figures since `PROBE_HOP_CHANNELS` trims refusals at startup.
+- Also lists the code-only config with current values and line numbers (output paths, `P0`/`N`, session/grouping thresholds, channel plan, probe settings, retry settings), an exit-status table (0 / 1 / 2 / prompt-cancel), and seven worked command examples.
+- Every value transcribed from the source at commit `51f1166`; the script was not executed (importing it triggers a `MacLookup` metadata download), so all figures are derived from the code rather than observed output.
+- Did not run any git command that writes; human manages version control.
+
+## 2026-08-07 (written) Researched vendor identification from radio/IE specification data
+
+- Created `research/2026-08-07_vendor_id_from_wifi_specs.md` and `research/vendor_ie_reference.md` — research/documentation only, **no source code changed**.
+- Question researched: how to attribute a device vendor when the MAC is randomized *and* the IE set is too sparse for the existing tag-221 OUI path (`vendor_from_ie_ouis()`, `src/night_sniffer_v3.py:333`) to resolve anything.
+- Main note surveys signals in six tiers, ranked by value-per-effort: vendor IE **OUI+type byte**, WPS/WSC vendor strings, randomized-MAC structural patterns, radio capability *field values* (HT/VHT/HE), supporting IEs (127/59/33/36/70/107/1/50), and behavioural signals (sequence numbers, IE ordering, probe timing).
+- Key finding, grounded in the 2024 APB paper's discriminator ranking: vendor-specific tags (7 of top-16 filters), HT Capabilities (6), Extended Capabilities (3). Our code keeps only 3 of the 4 vendor-type bytes, treats HT as a presence boolean, and never reads tag 127.
+- Highest-leverage recommendation recorded: build a local signature table seeded from our own captures — every *global*-MAC frame is a free labelled pair (real OUI vendor ↔ radio signature), which can then label randomized frames. Caveat also recorded: many Android devices emit a reduced signature when randomizing, so match on the stable radio subset rather than the full IE sequence.
+- Reference file carries paste-ready lookup data: 4-byte vendor-type table (confirmed from hostapd `ieee802_11_defs.h`), WPS/WSC attribute IDs, Primary Device Type categories, randomization-prefix table, and full bit layouts for HT Capability Info, A-MPDU Parameters, VHT Capabilities Info, and the tag-255 extension IDs. Items not verified from a primary source are marked *verify*.
+- **Ethical items raised for human decision, not implemented:**
+  - WPS `0x1047` UUID-E is reversible to the device's real global MAC via precomputed tables (~100% success in the literature). Passive, so not a rule violation, but it converts our output from session identifiers into permanent hardware identifiers. Recommended **against** implementing.
+  - WPS `0x1011` Device Name is frequently a personal name. Recommended not to log, or to log presence only.
+  - Recorded that the RTS/CTS derandomization technique from the literature requires frame transmission and is therefore **prohibited** by the passive-capture rule — noted explicitly so it is not rediscovered and mistaken for an option.
+- No dependencies added, no tests run (no code changed), no git write commands run.
+
+### Suggestions / Issues noticed
+1. `src/night_sniffer_v3.py:565` — tag 255 is flagged as `EXT_CAP`, but 255 is *Element ID Extension*; Extended Capabilities is tag 127. `IE_NAMES` (`:144`, `:149`) is correct, the capability-flag logic is not. Effect: 11ax/11be devices mislabelled, tag 127 never flagged.
+2. `src/night_sniffer_v3.py:192` — `NON_DEVICE_VENDOR_IE_OUIS` omits `50:6f:9a` (Wi-Fi Alliance: P2P/WFD/HS2.0/MBO), so a common protocol IE can be reported as a device vendor. Live false positive.
+3. `src/night_sniffer_v3.py:555` — SSID (tag 0) is folded into the IE fingerprint, so directed probes for different SSIDs from one device yield different `ie_fingerprint` hashes, weakening the session linking the hash exists for. Consider excluding tag 0 and tag 3.
+4. `src/night_sniffer_v3.py:555` — `info[:8]` truncation on the 26-byte HT Capabilities element discards most of the MCS set and all beamforming capability bytes before hashing.
+5. `src/night_sniffer_v3.py:166` — `KNOWN_OUIS` is queried from two different namespaces (MAC OUI prefixes at `:658`, tag-221 vendor OUIs at `:351`). Conflating them is why the `00:50:f2` entry has to read "Microsoft (Surface/WPS)". Worth splitting into two tables.
