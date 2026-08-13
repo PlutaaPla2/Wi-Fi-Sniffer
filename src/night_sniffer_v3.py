@@ -562,8 +562,24 @@ def extract_ie_details(pkt) -> dict[str, str]:
             capability_flags.add("EXT_RATES")
         elif ie_id in {191, 192}:
             capability_flags.add("VHT")
-        elif ie_id == 255:
+        elif ie_id == 127:
             capability_flags.add("EXT_CAP")
+        elif ie_id == 255 and info:
+            # Tag 255 is a container, not a leaf element: the first payload byte
+            # selects which element it carries. Ext IDs per IEEE 802.11-2024.
+            # The `and info` guard matters — a zero-length tag 255 is malformed
+            # but reachable from a truncated frame, and info[0] would raise
+            # IndexError inside the packet callback.
+            ext_id = info[0]
+            if ext_id in (35, 36):
+                capability_flags.add("HE")
+            elif ext_id == 108:
+                capability_flags.add("EHT")   # marked *verify* in vendor_ie_reference.md
+            else:
+                # Unrecognised extensions become discovery data rather than
+                # silence. `capabilities` is not an input to the merge scorer,
+                # so this costs nothing beyond CSV column noise.
+                capability_flags.add(f"EXT{ext_id}")
         elif ie_id == 221 and len(info) >= 3:
             oui = ":".join(f"{b:02x}" for b in info[:3])
             vendor_ies.add(oui)
@@ -646,7 +662,6 @@ def get_correlation_identity(pkt) -> str:
     """
     vendor       = "Generic"
     region       = "Unknown"
-    device_class = "IoT/Low-End"
     is_apple     = False
     found_oui    = "None"
 
@@ -689,8 +704,6 @@ def get_correlation_identity(pkt) -> str:
         if tag50:
             ch_list      = list(tag50.info)
             region       = "TH/EU" if (12 in ch_list or 13 in ch_list) else "US/Global"
-            if len(ch_list) > 11:
-                device_class = "High-End"
 
     if is_apple:
         return f"Apple Device ({region})"
