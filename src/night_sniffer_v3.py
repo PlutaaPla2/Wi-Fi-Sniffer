@@ -149,6 +149,28 @@ IE_NAMES: dict[int, str] = {
     255: "Element Extension",
 }
 
+# ── Fingerprint algorithm version ────────────────────────────────────────────
+# Bump ONLY when the INPUT to the SHA-1 in extract_ie_details() changes: the
+# excluded-tag set, the byte window, or the separator format. Adding CSV
+# columns, changing capability flags, or fixing vendor attribution does NOT
+# bump this.
+#
+# v1 → v2 (2026-08-13): excluded volatile tags {0, 3} from the hash input;
+#                       removed the 8-byte truncation, now hashes full IE
+#                       content. v1 and v2 values are not comparable.
+FINGERPRINT_VERSION = 2
+
+# Tags excluded from the fingerprint hash because they vary WITHIN a device
+# rather than between devices:
+#   0 — SSID. A wildcard probe and a directed probe from one phone, seconds
+#       apart, produce different hashes.
+#   3 — DS Parameter Set. Carries the channel the device is probing on, which
+#       our own hop sweep changes. Excluded UNCONDITIONALLY — making this
+#       mode-dependent would silently make camp and hop captures incomparable,
+#       which is the same class of bug being fixed here.
+# Both remain in ie_sequence, which correctly records presence and order.
+VOLATILE_IE_IDS = frozenset({0, 3})
+
 # ---------------------------------------------------------------------------
 # Logging
 # ---------------------------------------------------------------------------
@@ -552,7 +574,8 @@ def extract_ie_details(pkt) -> dict[str, str]:
 
     for ie_id, info in _iter_ies(pkt):
         sequence.append(str(ie_id))
-        fingerprint_parts.append(f"{ie_id}:{len(info)}:{info[:8].hex()}")
+        if ie_id not in VOLATILE_IE_IDS:
+            fingerprint_parts.append(f"{ie_id}:{len(info)}:{info.hex()}")
 
         if ie_id == 45:
             capability_flags.add("HT")
@@ -588,7 +611,8 @@ def extract_ie_details(pkt) -> dict[str, str]:
 
     raw_fingerprint = "|".join(fingerprint_parts)
     ie_fingerprint  = (
-        hashlib.sha1(raw_fingerprint.encode("ascii")).hexdigest()[:16]
+        f"fp{FINGERPRINT_VERSION}:"
+        f"{hashlib.sha1(raw_fingerprint.encode('ascii')).hexdigest()[:16]}"
         if raw_fingerprint else ""
     )
 
