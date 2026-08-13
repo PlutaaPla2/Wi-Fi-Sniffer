@@ -144,3 +144,18 @@ Track changes Claude makes to the Wi-Fi Sniffer project, in the same style as `T
 3. `src/night_sniffer_v3.py:555` — SSID (tag 0) is folded into the IE fingerprint, so directed probes for different SSIDs from one device yield different `ie_fingerprint` hashes, weakening the session linking the hash exists for. Consider excluding tag 0 and tag 3.
 4. `src/night_sniffer_v3.py:555` — `info[:8]` truncation on the 26-byte HT Capabilities element discards most of the MCS set and all beamforming capability bytes before hashing.
 5. `src/night_sniffer_v3.py:166` — `KNOWN_OUIS` is queried from two different namespaces (MAC OUI prefixes at `:658`, tag-221 vendor OUIs at `:351`). Conflating them is why the `00:50:f2` entry has to read "Microsoft (Surface/WPS)". Worth splitting into two tables.
+
+## 2026-08-07 (written 11:40) Wrote up the IE-parsing / vendor-attribution suggestions
+
+- Created `explanation/20260807_reverse_engineer_suggestion.md` — documentation only, **no source code changed**.
+- Expands the five "Suggestions / Issues noticed" items raised alongside the vendor-identification research above, following the format of `explanation/20260803_1030_suggestion.md`: summary table, then one section per issue with what the code does, why it is wrong, a worked failure case, verified blast radius, and options with trade-offs.
+- **Re-ordered by verified impact** rather than discovery order. Traced every consumer before writing: only two of the five can change a device count.
+  1. SSID (tag 0) folded into the IE fingerprint (`:555`) — **inflates** the people count. Worked the arithmetic: a fingerprint miss costs −3 against `GROUP_SCORE_THRESHOLD = 6`, dropping the ceiling from 12 to 6, so a correct merge then needs all six remaining signals to land. Tag 3 (DS Parameter Set) is worse in `--mode hop` because it varies by design of our own sweep.
+  2. `info[:8]` truncation (`:555`) — **deflates** the count. Tabulated what survives per element; the worst case is HE Capabilities, where 1 of the 11 chipset-rich HE PHY bytes is kept. Recorded that this must be fixed *after* #1, never before, or it amplifies the over-splitting.
+  3. `50:6f:9a` missing from `NON_DEVICE_VENDOR_IE_OUIS` (`:192`) — traced the full path showing a randomized Android emitting a P2P IE resolves to "Wi-Fi Alliance" via the `_vendor_lookup` fallback at `:356`.
+  4. Tag 255 flagged `EXT_CAP` (`:565`) — 255 is Element ID Extension, 127 is Extended Capabilities. `IE_NAMES` (`:144`, `:149`) is already correct, so the two CSV files currently disagree about the same frame.
+  5. `KNOWN_OUIS` (`:166`) queried from both the MAC-prefix and vendor-IE namespaces.
+- Two findings added that were not in the original list, both in `get_correlation_identity()`: (a) `Vendor` uses the full `mac_vendor_lookup` DB while `Note` uses only the 21-entry `KNOWN_OUIS`, so adjacent CSV columns can disagree on the same MAC; (b) the `:701` fallback is unreachable because `vendor` is overwritten at `:658` by a function that never returns `"Generic"`.
+- Recorded two blast-radius facts that are easy to assume wrongly: `estimate_devices_from_csv.py` hard-exits on v3 output (it requires the lowercase `wifi_sniffer.py` schema per `estimate_devices_from_csv.py:116-121`), and `identity` never reaches the merge scoring — it is stored at `:1019` and printed at `:1058` only.
+- Nothing was fixed. Every item is either outside the scope of the research task or a decision for the human. Suggested work order and a note that #1 and #2 both invalidate historical `IE_Fingerprint` values and should ship as one migration if both are taken.
+- No dependencies added, no tests run (no code changed), no git write commands run.
