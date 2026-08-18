@@ -214,5 +214,113 @@ class NightSnifferV3PacketHandlerTests(unittest.TestCase):
         )
 
 
+class NightSnifferV3ReplayClockTests(unittest.TestCase):
+    """The --pcap replay path must timestamp frames from the capture, not the run.
+
+    Without this the whole point of replay is lost: every row would carry the
+    replay's wall clock, Interval_sec would measure parsing speed rather than
+    the gap between frames, and SESSION_TIMEOUT would never fire because a
+    night's capture would collapse into a few seconds.
+    """
+
+    def setUp(self):
+        self._replay_mode = night_sniffer_v3.REPLAY_MODE
+        self._frame_time = night_sniffer_v3._CURRENT_FRAME_TIME
+
+    def tearDown(self):
+        night_sniffer_v3.REPLAY_MODE = self._replay_mode
+        night_sniffer_v3._CURRENT_FRAME_TIME = self._frame_time
+
+    @staticmethod
+    def _packet(ts):
+        """Minimal stand-in for a scapy packet carrying a capture timestamp."""
+        return types.SimpleNamespace(time=ts)
+
+    def test_live_mode_uses_wall_clock_and_leaves_now_on_wall_clock(self):
+        night_sniffer_v3.REPLAY_MODE = False
+        with patch.object(night_sniffer_v3.time, "time", return_value=5000.0):
+            # Even though the packet claims a much older capture time, live
+            # capture must ignore it — the frame arrived now.
+            self.assertEqual(night_sniffer_v3._frame_time(self._packet(10.0)), 5000.0)
+            self.assertIsNone(night_sniffer_v3._CURRENT_FRAME_TIME)
+            self.assertEqual(night_sniffer_v3._now(), 5000.0)
+
+    def test_replay_mode_uses_capture_time_for_frame_and_session_clock(self):
+        night_sniffer_v3.REPLAY_MODE = True
+        with patch.object(night_sniffer_v3.time, "time", return_value=5000.0):
+            self.assertEqual(night_sniffer_v3._frame_time(self._packet(1234.5)), 1234.5)
+            self.assertEqual(night_sniffer_v3._now(), 1234.5)
+
+    def test_replay_mode_converts_decimal_capture_times_to_float(self):
+        # Scapy hands back an EDecimal for pcap timestamps. Left unconverted it
+        # raises as soon as it meets a float in the session arithmetic.
+        from decimal import Decimal
+
+        night_sniffer_v3.REPLAY_MODE = True
+        result = night_sniffer_v3._frame_time(self._packet(Decimal("1234.5")))
+        self.assertIsInstance(result, float)
+        self.assertEqual(result, 1234.5)
+
+    def test_replay_mode_falls_back_when_a_frame_carries_no_time(self):
+        night_sniffer_v3.REPLAY_MODE = True
+        with patch.object(night_sniffer_v3.time, "time", return_value=5000.0):
+            # Must not raise inside the packet callback: scapy closes the
+            # capture socket on any exception escaping prn.
+            self.assertEqual(night_sniffer_v3._frame_time(types.SimpleNamespace()), 5000.0)
+
+    def test_track_session_runs_on_the_frame_clock_during_replay(self):
+        night_sniffer_v3.active_sessions.clear()
+        night_sniffer_v3._last_seen.clear()
+        night_sniffer_v3.REPLAY_MODE = True
+        night_sniffer_v3._CURRENT_FRAME_TIME = 9000.0
+        with patch.object(night_sniffer_v3.time, "time", return_value=5000.0):
+            night_sniffer_v3.track_session(
+                mac="02:11:22:33:44:55",
+                identity="Apple Device (US/Global)",
+                power=-50,
+                zone="near",
+                ssids=["Office"],
+                frame_type="PROBE",
+                ie_fingerprint="fp2:abc",
+                vendor_ies="00:17:f2",
+                mac_type="Randomized",
+            )
+        session = night_sniffer_v3.active_sessions[1]
+        self.assertEqual(session.first_ts, 9000.0)
+        self.assertEqual(session.last_ts, 9000.0)
+
+
+class NightSnifferV3OutputDirTests(unittest.TestCase):
+    """--out-dir must move all three reports, so a replay cannot clobber a capture."""
+
+    def setUp(self):
+        self._paths = (
+            night_sniffer_v3.LOG_FILE,
+            night_sniffer_v3.IE_DETAILS_FILE,
+            night_sniffer_v3.SUMMARY_DIR,
+        )
+
+    def tearDown(self):
+        (night_sniffer_v3.LOG_FILE,
+         night_sniffer_v3.IE_DETAILS_FILE,
+         night_sniffer_v3.SUMMARY_DIR) = self._paths
+
+    def test_redirects_all_three_outputs_and_keeps_basenames(self):
+        import os
+        import tempfile
+
+        original_log = os.path.basename(night_sniffer_v3.LOG_FILE)
+        original_ie = os.path.basename(night_sniffer_v3.IE_DETAILS_FILE)
+        with tempfile.TemporaryDirectory() as tmp:
+            target = os.path.join(tmp, "made", "on", "demand")
+            night_sniffer_v3.apply_output_dir(target)
+            self.assertTrue(os.path.isdir(target))
+            self.assertEqual(night_sniffer_v3.LOG_FILE,
+                             os.path.join(target, original_log))
+            self.assertEqual(night_sniffer_v3.IE_DETAILS_FILE,
+                             os.path.join(target, original_ie))
+            self.assertEqual(night_sniffer_v3.SUMMARY_DIR, target)
+
+
 if __name__ == "__main__":
     unittest.main()

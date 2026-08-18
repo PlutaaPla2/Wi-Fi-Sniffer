@@ -103,6 +103,26 @@ CLIENT_FRAME_TYPES = {
 # Set from the --frames CLI flag in main().
 TERMINAL_FRAME_FILTER = "all"
 
+# ── Offline replay (--pcap) ──────────────────────────────────────────────────
+# Replay feeds a previously recorded pcap through the exact same handle_packet()
+# path as a live capture, so a dumpcap file can be measured against this tool on
+# identical input. Nothing here touches the radio: replay never opens an
+# interface, never tunes a channel and never starts the hopper.
+#
+# REPLAY_MODE also switches the time source. Live capture timestamps a frame at
+# the moment it is received; a replay must instead use the capture time stored
+# in the pcap, or a whole night collapses into the few seconds the replay takes
+# and both Interval_sec and SESSION_TIMEOUT become measurements of our own
+# parsing speed. Set from the --pcap CLI flag in main().
+REPLAY_MODE = False
+
+# Capture time of the frame currently being handled, published by _frame_time()
+# for the session tracker to read via _now(). Always None during live capture,
+# which is what makes _now() fall back to the wall clock there. Only ever
+# written from the single sniff() thread, and the auto-save thread that would
+# otherwise race it is not started in replay mode.
+_CURRENT_FRAME_TIME: float | None = None
+
 CSV_FIELDS = [
     "Timestamp", "Pkt_Type", "MAC_Address", "Device_Type",
     "Vendor", "SSID", "Channel", "Band", "Power_dBm", "Distance_m",
@@ -269,6 +289,24 @@ except Exception:
 # Helper functions
 # ---------------------------------------------------------------------------
 
+def apply_output_dir(out_dir: str) -> None:
+    """
+    Redirect all three report files into ``out_dir``, creating it if needed.
+
+    Exists so a replay can be written somewhere other than the live capture's
+    output. Without it, replaying a pcap would append to the accumulating
+    wifi_full_recon_report.csv and — worse — setup_ie_csv() opens the per-IE
+    report with mode "w", so a replay would truncate the IE breakdown belonging
+    to a real capture. Basenames are kept exactly as configured above so the
+    parity tooling and fingerprint_baseline.py find the same filenames.
+    """
+    global LOG_FILE, IE_DETAILS_FILE, SUMMARY_DIR
+    os.makedirs(out_dir, exist_ok=True)
+    LOG_FILE        = os.path.join(out_dir, os.path.basename(LOG_FILE))
+    IE_DETAILS_FILE = os.path.join(out_dir, os.path.basename(IE_DETAILS_FILE))
+    SUMMARY_DIR     = out_dir
+
+
 def setup_csv() -> None:
     """Create CSV with header row if the file does not yet exist."""
     if not os.path.exists(LOG_FILE):
@@ -391,6 +429,39 @@ def oui_int_to_str(raw_oui: int) -> str:
 def _format_ts(ts: float) -> str:
     """Return a full local timestamp for session reports."""
     return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts))
+
+
+def _frame_time(pkt) -> float:
+    """
+    Return the time this frame should be attributed to, and publish it for _now().
+
+    Live capture keeps the historical behaviour exactly: the frame arrived just
+    now, so the wall clock is the right answer and _CURRENT_FRAME_TIME is left
+    None so _now() stays on the wall clock too.
+
+    Replay reads the capture time recorded in the pcap. Scapy hands that back as
+    an EDecimal; it is converted once here so no downstream arithmetic ends up
+    mixing Decimal with float. A pcap frame with no usable time falls back to
+    the wall clock rather than raising inside the packet callback.
+    """
+    global _CURRENT_FRAME_TIME
+    if not REPLAY_MODE:
+        _CURRENT_FRAME_TIME = None
+        return time.time()
+    raw = getattr(pkt, "time", None)
+    _CURRENT_FRAME_TIME = time.time() if raw is None else float(raw)
+    return _CURRENT_FRAME_TIME
+
+
+def _now() -> float:
+    """
+    Current time for session bookkeeping: frame time in replay, wall clock live.
+
+    Session expiry, merge time windows and stay durations all have to run on the
+    same clock as the frames feeding them, or a replayed capture never expires a
+    session and reports one long stay per device.
+    """
+    return time.time() if _CURRENT_FRAME_TIME is None else _CURRENT_FRAME_TIME
 
 
 def _safe_upper_mac(mac: str | None) -> str:
@@ -1004,7 +1075,7 @@ def track_session(
     Match this observation to an existing session or create a new one.
     Returns a label like 'New-User-3' or 'Existing-User-1'.
     """
-    now            = time.time()
+    now            = _now()
     fingerprint    = identity.split("[OUI:")[0].strip()
     ssid_set       = {ssid for ssid in ssids if ssid}
     vendor_ie_set  = _parse_set(vendor_ies)
@@ -1206,11 +1277,14 @@ def handle_packet(pkt) -> None:
             channel = _freq_to_channel(rtap.Channel)
             band    = _freq_to_band(rtap.Channel)
 
-    timestamp    = time.strftime("%Y-%m-%d %H:%M:%S")
+    # Live: the wall clock, identical to the previous time.strftime() with no
+    # argument. Replay: the frame's own capture time, so the CSV describes the
+    # capture rather than the moment the replay happened to run.
+    now          = _frame_time(pkt)
+    timestamp    = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(now))
     dist_m       = calculate_distance(power)
     zone         = proximity_zone(dist_m)
     mac_type     = check_mac_type(mac_addr)
-    now          = time.time()
     interval     = round(now - _last_seen.get(mac_addr, now), 2)
     _last_seen[mac_addr] = now
 
@@ -1407,6 +1481,68 @@ def prompt_camp_channel() -> int:
 
 
 # ---------------------------------------------------------------------------
+# Offline replay
+# ---------------------------------------------------------------------------
+
+def run_replay(pcap_path: str, parser: argparse.ArgumentParser) -> None:
+    """
+    Feed ``pcap_path`` through handle_packet() exactly as a live capture would.
+
+    This is the measurement path the tool previously lacked: with it, the same
+    dumpcap file can be run through this tool and through tshark, so coverage
+    claims can be checked against a fixed input instead of against a second
+    capture taken at a different time.
+
+    Strictly read-only with respect to the radio — no interface is opened, no
+    channel is tuned, and the hopper thread is never started. The auto-save
+    thread is skipped too: it sleeps on the wall clock, which no longer matches
+    the frame clock during replay, and a single report is written at the end
+    anyway.
+    """
+    global REPLAY_MODE
+
+    if not os.path.isfile(pcap_path):
+        parser.error(f"--pcap: no such file: {pcap_path}")
+
+    REPLAY_MODE = True
+    setup_csv()
+    setup_ie_csv()
+
+    log.info("Replaying capture file          : %s", pcap_path)
+    log.info("Logging packets to              : %s", LOG_FILE)
+    log.info("Logging IE breakdown to         : %s", IE_DETAILS_FILE)
+    log.info("Terminal frame filter           : %s", TERMINAL_FRAME_FILTER)
+
+    sep = "-" * 110
+    print(sep)
+    print(f"{'Type':11} | {'Timestamp':19} | {'MAC Address':17} | {'CH':<4}| "
+          f"{'Pwr':>4} | {'Dist':>5} | SSID")
+    print(sep)
+
+    # Counted out here rather than inside handle_packet so the live path keeps
+    # its current shape. `total` is every frame scapy handed us; handle_packet
+    # decides on its own which of those reach the CSV.
+    total = 0
+
+    def count_and_handle(pkt) -> None:
+        nonlocal total
+        total += 1
+        handle_packet(pkt)
+
+    try:
+        sniff(offline=pcap_path, prn=count_and_handle, store=False)
+    except KeyboardInterrupt:
+        log.info("Interrupted – saving report for the frames read so far …")
+    except (OSError, ValueError) as exc:
+        # Unreadable or non-pcap input: report it plainly rather than dumping a
+        # scapy traceback, and still write whatever was parsed before the error.
+        log.error("Could not read %s: %s", pcap_path, exc)
+
+    log.info("Replay finished — %d frame(s) read from %s", total, pcap_path)
+    generate_session_report()
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
@@ -1447,6 +1583,21 @@ def main() -> None:
         help="Backwards-compatible alias for --mode hop.",
     )
     parser.add_argument(
+        "--pcap",
+        default=None,
+        help="Replay a previously recorded pcap through the normal packet "
+             "handler instead of capturing live. Opens no interface and tunes "
+             "no channel, so --iface/--mode/--band/--channel/--hop are ignored. "
+             "Timestamps come from the pcap, not the wall clock. Pair with "
+             "--out-dir so the replay does not overwrite live capture output.",
+    )
+    parser.add_argument(
+        "--out-dir",
+        default=None,
+        help="Write all three reports into this directory instead of the "
+             "configured defaults. Created if missing; filenames are unchanged.",
+    )
+    parser.add_argument(
         "--frames",
         choices=["all", "no-beacon"],
         default="all",
@@ -1461,6 +1612,31 @@ def main() -> None:
 
     global TERMINAL_FRAME_FILTER
     TERMINAL_FRAME_FILTER = args.frames
+
+    if args.out_dir:
+        apply_output_dir(args.out_dir)
+
+    # ── Offline replay ───────────────────────────────────────────────────────
+    # Handled before any settings resolution: replay owns no radio, so none of
+    # the interface / channel questions apply and none of their prompts should
+    # ever be shown.
+    if args.pcap:
+        # Say so rather than silently ignoring them, matching how camp/hop mode
+        # already reports flags that do not apply to the selected mode.
+        radio_flags = [
+            name for name, value in (
+                ("--iface",   args.iface),
+                ("--mode",    args.mode),
+                ("--band",    args.band),
+                ("--channel", args.channel),
+                ("--hop",     args.hop or None),
+            ) if value is not None
+        ]
+        if radio_flags:
+            log.warning("%s ignored in --pcap replay mode (no radio is used).",
+                        ", ".join(radio_flags))
+        run_replay(args.pcap, parser)
+        return
 
     # ── Settings resolution ──────────────────────────────────────────────────
     # For each setting: the CLI flag wins, otherwise ask if there is a terminal
