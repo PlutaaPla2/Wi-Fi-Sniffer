@@ -17,8 +17,11 @@ import subprocess
 from dataclasses import dataclass, field
 from scapy.all import sniff
 from scapy.layers.dot11 import (
-    Dot11, Dot11ProbeReq, Dot11Beacon,
-    Dot11AssoReq, Dot11AssoResp, Dot11ReassoReq, Dot11ReassoResp,
+    # Dot11 is the classifier's only entry point now — subtypes are read from
+    # the frame control field, not matched against per-subtype layer classes.
+    # The layers below are still needed by parse_frame_body() for their fixed
+    # fields, and by the IE helpers.
+    Dot11, Dot11AssoReq, Dot11ReassoReq,
     Dot11Auth, Dot11Deauth, Dot11Disas, RadioTap,
     Dot11Elt, Dot11EltVendorSpecific
 )
@@ -92,6 +95,53 @@ PROBE_SETTLE       = 0.05   # Seconds to let the driver settle between probes
 MAX_RETRIES  = 10   # maximum reconnect attempts before giving up
 RETRY_DELAY  = 3    # seconds to wait between each attempt
 
+# ── Management frame subtypes ────────────────────────────────────────────────
+# Every 802.11 management subtype (frame control type == 0), IEEE 802.11-2020
+# 9.2.4.1.3, mapped to the Pkt_Type label written to the CSV.
+#
+# classify_frame() reads this subtype field directly instead of testing Scapy
+# layer classes, for two measured reasons:
+#
+#   * Coverage. Scapy binds a layer class to only 12 of the 16 subtypes, so a
+#     layer-based allowlist cannot see the rest at all. Probe Response and
+#     Action were among the frames being dropped, and those are ordinarily the
+#     most common management frames after beacons.
+#   * Correctness. Dot11ReassoResp subclasses Dot11AssoResp, and Dot11FCS sets
+#     match_subclass = True, which makes Scapy's haslayer() propagate subclass
+#     matching down the rest of the layer chain. A Reassociation Response
+#     therefore satisfied haslayer(Dot11AssoResp) on any capture carrying an
+#     FCS — which is every capture from the AR9271 — and was recorded under the
+#     wrong label. The subtype field is unambiguous.
+#
+# Labels for subtypes that were already tracked are unchanged, so CSVs written
+# before and after this change stay comparable. Reserved subtypes get a
+# MGMT_<n> label rather than being dropped: an unexpected frame is evidence,
+# and dumpcap would have kept it.
+MGMT_SUBTYPE_LABELS: dict[int, str] = {
+    0:  "ASSOC_REQ",
+    1:  "ASSOC_RESP",
+    2:  "REASSOC_REQ",
+    3:  "REASSOC_RESP",
+    4:  "PROBE",
+    5:  "PROBE_RESP",
+    6:  "TIMING_AD",
+    7:  "MGMT_7",
+    8:  "BEACON",
+    9:  "ATIM",
+    10: "DISASSOC",
+    11: "AUTH",
+    12: "DEAUTH",
+    13: "ACTION",
+    14: "ACTION_NOACK",
+    15: "MGMT_15",
+}
+
+# Frame types that feed session tracking and the device-count model. This is
+# deliberately NOT every client-originated subtype: it is the set the scorer in
+# _same_randomized_session_score() was tuned against. Subtypes added to
+# MGMT_SUBTYPE_LABELS are captured, fingerprinted and logged, but stay out of
+# the count until that model is reviewed — widening capture and widening the
+# device count are separate decisions.
 CLIENT_FRAME_TYPES = {
     "PROBE", "ASSOC_REQ", "REASSOC_REQ", "AUTH", "DEAUTH", "DISASSOC",
 }
@@ -1218,42 +1268,64 @@ def _pick_colour(identity: str) -> str:
 
 def classify_frame(pkt) -> tuple[str | None, str]:
     """
-    Identify a supported 802.11 management frame and its source MAC.
+    Identify an 802.11 management frame and the address to attribute it to.
 
-    Catches the association family in full, including the rarely-captured
-    association/reassociation *response* frames the AP sends back to a client
-    (ASSOC_RESP / REASSOC_RESP) — these only appear during the brief connection
-    handshake, so they seldom show up in a passive capture. Returns
-    ``(pkt_type, mac_addr)`` or ``(None, "")`` for frames we don't track.
+    Returns ``(pkt_type, mac_addr)`` for every management frame — all sixteen
+    subtypes, per MGMT_SUBTYPE_LABELS — or ``(None, "")`` for control and data
+    frames, which are out of scope and which dumpcap's `type mgt` filter would
+    not have kept either.
 
-    Ordered so the more specific *response* checks run before the request
-    layers they subclass, avoiding misclassification.
+    The address is the transmitter (addr2), falling back to addr3 then addr1 so
+    a frame with a malformed transmitter address is still recorded rather than
+    discarded. Beacons keep reading addr3 (the BSSID) first, as they always
+    have: on a normal AP addr2 and addr3 are the same address, but they differ
+    on a repeater or mesh node, and wifi_full_recon_report.csv accumulates
+    across runs — switching the column's meaning mid-file would leave old and
+    new beacon rows quietly incomparable.
+
+    ``mac_addr`` can still come back empty for a badly truncated frame — that is
+    for handle_packet() to interpret, not a reason to lose the frame here.
     """
-    if pkt.haslayer(Dot11Beacon):
-        return "BEACON", _safe_upper_mac(pkt.addr3)
-    if pkt.haslayer(Dot11ProbeReq):
-        return "PROBE", _safe_upper_mac(pkt.addr2)
-    if pkt.haslayer(Dot11AssoResp):
-        return "ASSOC_RESP", _safe_upper_mac(pkt.addr2)
-    if pkt.haslayer(Dot11AssoReq):
-        return "ASSOC_REQ", _safe_upper_mac(pkt.addr2)
-    if pkt.haslayer(Dot11ReassoResp):
-        return "REASSOC_RESP", _safe_upper_mac(pkt.addr2)
-    if pkt.haslayer(Dot11ReassoReq):
-        return "REASSOC_REQ", _safe_upper_mac(pkt.addr2)
-    if pkt.haslayer(Dot11Auth):
-        return "AUTH", _safe_upper_mac(pkt.addr2)
-    if pkt.haslayer(Dot11Deauth):
-        return "DEAUTH", _safe_upper_mac(pkt.addr2)
-    if pkt.haslayer(Dot11Disas):
-        return "DISASSOC", _safe_upper_mac(pkt.addr2)
-    return None, ""
+    dot11 = pkt.getlayer(Dot11)
+    if dot11 is None:
+        return None, ""
+
+    try:
+        frame_type = int(dot11.type)
+        subtype    = int(dot11.subtype)
+    except (AttributeError, TypeError, ValueError):
+        # A frame mangled badly enough that the control field will not resolve.
+        # Returning rather than raising matters: Scapy closes the capture socket
+        # on any exception escaping the packet callback.
+        return None, ""
+
+    if frame_type != 0:
+        return None, ""
+
+    # .get() with a computed default rather than a bare lookup: subtype is a
+    # 4-bit field so the table is exhaustive today, but a label is cheaper than
+    # a dropped frame if that ever stops being true.
+    label = MGMT_SUBTYPE_LABELS.get(subtype, f"MGMT_{subtype}")
+
+    # Beacons: BSSID first, preserving the column's historical meaning. Every
+    # other subtype: transmitter first, which is what it has always used.
+    order = ("addr3", "addr2", "addr1") if label == "BEACON" else \
+            ("addr2", "addr3", "addr1")
+    mac_addr = ""
+    for field in order:
+        mac_addr = _safe_upper_mac(getattr(dot11, field, None))
+        if mac_addr:
+            break
+    return label, mac_addr
 
 
 def handle_packet(pkt) -> None:
     """Process each captured 802.11 frame."""
     pkt_type, mac_addr = classify_frame(pkt)
-    if pkt_type is None or not mac_addr:
+    # Only non-management frames are skipped. A management frame whose address
+    # could not be read is still a frame dumpcap would have recorded, so it is
+    # logged with an empty MAC_Address rather than discarded.
+    if pkt_type is None:
         return
 
     seq = (
@@ -1262,9 +1334,13 @@ def handle_packet(pkt) -> None:
         else None
     )
 
+    # A zero-length SSID element means different things by subtype: from an AP
+    # advertising a BSS it is a hidden network, from a client it is a wildcard
+    # probe. Probe Responses are AP-originated and carry the same hidden-SSID
+    # convention as beacons.
     ssid = extract_ssid(
         pkt,
-        "(Hidden SSID)" if pkt_type == "BEACON" else "(Wildcard)",
+        "(Hidden SSID)" if pkt_type in ("BEACON", "PROBE_RESP") else "(Wildcard)",
     )
 
     power: int   = 0
@@ -1300,7 +1376,13 @@ def handle_packet(pkt) -> None:
         vendor = get_vendor(mac_addr, mac_type)
     else:
         vendor = vendor_from_ie_ouis(ie_details["vendor_ies"])
-    if pkt_type in CLIENT_FRAME_TYPES:
+    # A frame with no readable address cannot be attributed to a device at all,
+    # so it is logged and goes no further. Otherwise session tracking runs for
+    # the client subtypes it was tuned against; everything else — beacons, the
+    # response frames, and the subtypes added alongside them — is logged only.
+    if not mac_addr:
+        session_note = "No-Address"
+    elif pkt_type in CLIENT_FRAME_TYPES:
         session_note = track_session(
             mac_addr, identity, power, zone, [ssid], pkt_type,
             ie_details["ie_fingerprint"], ie_details["vendor_ies"], mac_type, seq,

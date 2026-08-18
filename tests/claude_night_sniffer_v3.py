@@ -64,15 +64,28 @@ ns = importlib.import_module("night_sniffer_v3")
 # ---------------------------------------------------------------------------
 
 class FakePacket:
-    """Minimal Dot11-like packet: layer membership + arbitrary attrs."""
+    """Minimal Dot11-like packet: layer membership + arbitrary attrs.
 
-    def __init__(self, layers=(), **attrs):
+    ``subtype`` opts the packet into the frame-control interface classify_frame()
+    now uses — it reads the type/subtype field through getlayer(Dot11) rather
+    than testing per-subtype layer classes. ``layers`` is still honoured for the
+    other helpers that do use haslayer().
+    """
+
+    def __init__(self, layers=(), type=0, subtype=None, **attrs):
         self._layers = set(layers)
+        self.type = type
+        self.subtype = subtype
         for key, value in attrs.items():
             setattr(self, key, value)
 
     def haslayer(self, layer):
         return layer in self._layers
+
+    def getlayer(self, layer):
+        if layer is ns.Dot11 and self.subtype is not None:
+            return self
+        return None
 
 
 class VendorNode:
@@ -337,40 +350,69 @@ class ParseSetTests(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 class ClassifyFrameTests(unittest.TestCase):
+    """Frames are classified from the frame-control subtype field.
+
+    These tests previously described a ladder of haslayer() checks whose
+    ordering was meant to stop Scapy's layer subclassing from misreporting the
+    response frames. That ordering did not survive contact with a capture
+    carrying an FCS, so classification now reads the subtype directly. The
+    intent of each case is unchanged; only the mechanism it exercises is.
+    """
+
     def test_beacon_uses_addr3(self):
-        pkt = FakePacket(layers=(ns.Dot11Beacon,), addr3="aa:bb:cc:dd:ee:ff")
+        pkt = FakePacket(subtype=8, addr3="aa:bb:cc:dd:ee:ff")
         self.assertEqual(ns.classify_frame(pkt), ("BEACON", "AA:BB:CC:DD:EE:FF"))
 
+    def test_beacon_prefers_bssid_over_transmitter(self):
+        # These are the same address on a normal AP but differ on a repeater.
+        # The column has always meant the BSSID for beacons and must keep to it,
+        # because wifi_full_recon_report.csv accumulates across runs.
+        pkt = FakePacket(subtype=8, addr2="11:22:33:44:55:66",
+                         addr3="aa:bb:cc:dd:ee:ff")
+        self.assertEqual(ns.classify_frame(pkt)[1], "AA:BB:CC:DD:EE:FF")
+
     def test_probe_request_uses_addr2(self):
-        pkt = FakePacket(layers=(ns.Dot11ProbeReq,), addr2="11:22:33:44:55:66")
+        pkt = FakePacket(subtype=4, addr2="11:22:33:44:55:66")
         self.assertEqual(ns.classify_frame(pkt), ("PROBE", "11:22:33:44:55:66".upper()))
 
-    def test_assoc_response_takes_priority_over_assoc_request(self):
-        # In real scapy, a Dot11AssoResp frame also satisfies
-        # haslayer(Dot11AssoReq) because it subclasses it; classify_frame
-        # checks *Resp before *Req specifically to avoid misreporting it.
-        pkt = FakePacket(
-            layers=(ns.Dot11AssoReq, ns.Dot11AssoResp), addr2="00:00:00:00:00:01"
-        )
-        pkt_type, _ = ns.classify_frame(pkt)
-        self.assertEqual(pkt_type, "ASSOC_RESP")
+    def test_transmitter_address_wins_over_bssid(self):
+        pkt = FakePacket(subtype=4, addr2="11:22:33:44:55:66",
+                         addr3="aa:bb:cc:dd:ee:ff")
+        self.assertEqual(ns.classify_frame(pkt)[1], "11:22:33:44:55:66".upper())
 
-    def test_reassoc_response_takes_priority_over_reassoc_request(self):
-        pkt = FakePacket(
-            layers=(ns.Dot11ReassoReq, ns.Dot11ReassoResp), addr2="00:00:00:00:00:02"
-        )
-        pkt_type, _ = ns.classify_frame(pkt)
-        self.assertEqual(pkt_type, "REASSOC_RESP")
+    def test_association_response_is_labelled_as_a_response(self):
+        pkt = FakePacket(subtype=1, addr2="00:00:00:00:00:01")
+        self.assertEqual(ns.classify_frame(pkt)[0], "ASSOC_RESP")
+
+    def test_reassociation_response_is_not_confused_with_association_response(self):
+        # The bug this replaces: Dot11ReassoResp subclasses Dot11AssoResp, and
+        # with Dot11FCS in the chain haslayer() matched the parent class first,
+        # so every Reassociation Response was recorded as ASSOC_RESP.
+        pkt = FakePacket(subtype=3, addr2="00:00:00:00:00:02")
+        self.assertEqual(ns.classify_frame(pkt)[0], "REASSOC_RESP")
 
     def test_deauth_and_disassoc(self):
-        deauth = FakePacket(layers=(ns.Dot11Deauth,), addr2="a")
-        disassoc = FakePacket(layers=(ns.Dot11Disas,), addr2="b")
+        deauth = FakePacket(subtype=12, addr2="a")
+        disassoc = FakePacket(subtype=10, addr2="b")
         self.assertEqual(ns.classify_frame(deauth)[0], "DEAUTH")
         self.assertEqual(ns.classify_frame(disassoc)[0], "DISASSOC")
 
-    def test_unsupported_frame_is_ignored(self):
-        pkt = FakePacket(layers=())
-        self.assertEqual(ns.classify_frame(pkt), (None, ""))
+    def test_previously_unsupported_subtypes_are_now_captured(self):
+        # Probe Response and Action were silently dropped before; both are
+        # ordinarily more common than every subtype below them in this file.
+        for subtype, label in ((5, "PROBE_RESP"), (13, "ACTION"), (9, "ATIM")):
+            with self.subTest(subtype=subtype):
+                pkt = FakePacket(subtype=subtype, addr2="00:00:00:00:00:03")
+                self.assertEqual(ns.classify_frame(pkt)[0], label)
+
+    def test_non_management_frame_is_ignored(self):
+        # Control (1) and data (2) frames stay out of scope, matching the
+        # `type mgt` filter the reference dumpcap capture uses.
+        self.assertEqual(
+            ns.classify_frame(FakePacket(type=2, subtype=0, addr2="a")), (None, "")
+        )
+        # A packet with no Dot11 layer at all.
+        self.assertEqual(ns.classify_frame(FakePacket(layers=())), (None, ""))
 
 
 # ---------------------------------------------------------------------------

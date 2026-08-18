@@ -213,6 +213,143 @@ class NightSnifferV3PacketHandlerTests(unittest.TestCase):
             night_sniffer_v3.CSV_FIELDS[-8], "Seq_Num"
         )
 
+    def test_management_frame_without_an_address_is_logged_not_dropped(self):
+        """A frame dumpcap would have kept must reach the CSV even unattributable."""
+
+        class FakePacket:
+            dot11 = types.SimpleNamespace(SC=(1 << 4) | 0)
+
+            def haslayer(self, layer):
+                return layer is night_sniffer_v3.Dot11
+
+            def __getitem__(self, layer):
+                return self.dot11
+
+        ie_details = {
+            "ie_sequence": "",
+            "ie_fingerprint": "",
+            "vendor_ies": "",
+            "capabilities": "",
+        }
+        with patch.object(
+            night_sniffer_v3, "classify_frame", return_value=("ACTION", "")
+        ), patch.object(
+            night_sniffer_v3, "extract_ssid", return_value="(Wildcard)"
+        ), patch.object(
+            night_sniffer_v3, "get_correlation_identity", return_value="Unknown"
+        ), patch.object(
+            night_sniffer_v3, "extract_ie_details", return_value=ie_details
+        ), patch.object(
+            night_sniffer_v3, "track_session"
+        ) as track_session, patch.object(
+            night_sniffer_v3, "_append_csv_row"
+        ) as append_row, patch.object(
+            night_sniffer_v3, "dump_ie_details"
+        ), patch("builtins.print"):
+            night_sniffer_v3.handle_packet(FakePacket())
+
+        append_row.assert_called_once()
+        row = append_row.call_args.args[0]
+        self.assertEqual(row[night_sniffer_v3.CSV_FIELDS.index("Pkt_Type")], "ACTION")
+        self.assertEqual(row[night_sniffer_v3.CSV_FIELDS.index("MAC_Address")], "")
+        # Logged, but never fed to the device-count model: an address-less frame
+        # cannot be attributed to a device.
+        self.assertIn(
+            "No-Address", row[night_sniffer_v3.CSV_FIELDS.index("Session_Note")]
+        )
+        track_session.assert_not_called()
+
+
+class _FakeDot11:
+    """Stand-in for a dissected Dot11 layer, carrying only what the classifier reads."""
+
+    def __init__(self, type_=0, subtype=0, addr1=None, addr2=None, addr3=None):
+        self.type = type_
+        self.subtype = subtype
+        self.addr1 = addr1
+        self.addr2 = addr2
+        self.addr3 = addr3
+
+
+class _FakePkt:
+    def __init__(self, dot11):
+        self._dot11 = dot11
+
+    def getlayer(self, layer):
+        if layer is night_sniffer_v3.Dot11:
+            return self._dot11
+        return None
+
+
+class NightSnifferV3ClassifyFrameTests(unittest.TestCase):
+    """Every management subtype must be recognised, and labelled as itself."""
+
+    @staticmethod
+    def _classify(**kwargs):
+        return night_sniffer_v3.classify_frame(_FakePkt(_FakeDot11(**kwargs)))
+
+    def test_every_management_subtype_is_recognised(self):
+        # The whole 4-bit space, so a frame can never fall through unclassified.
+        for subtype in range(16):
+            with self.subTest(subtype=subtype):
+                label, mac = self._classify(
+                    type_=0, subtype=subtype, addr2="aa:bb:cc:dd:ee:ff"
+                )
+                self.assertEqual(label, night_sniffer_v3.MGMT_SUBTYPE_LABELS[subtype])
+                self.assertEqual(mac, "AA:BB:CC:DD:EE:FF")
+
+    def test_reassociation_response_is_not_labelled_as_association_response(self):
+        # Regression test for the Dot11ReassoResp/Dot11AssoResp subclass trap:
+        # with an FCS present, haslayer(Dot11AssoResp) matched subtype 3 too.
+        label, _mac = self._classify(type_=0, subtype=3, addr2="aa:bb:cc:dd:ee:ff")
+        self.assertEqual(label, "REASSOC_RESP")
+
+    def test_historical_labels_are_preserved(self):
+        # Renaming any of these silently breaks comparison against CSVs written
+        # before all sixteen subtypes were captured.
+        expected = {
+            0: "ASSOC_REQ", 1: "ASSOC_RESP", 2: "REASSOC_REQ", 3: "REASSOC_RESP",
+            4: "PROBE", 8: "BEACON", 10: "DISASSOC", 11: "AUTH", 12: "DEAUTH",
+        }
+        for subtype, label in expected.items():
+            with self.subTest(subtype=subtype):
+                self.assertEqual(night_sniffer_v3.MGMT_SUBTYPE_LABELS[subtype], label)
+
+    def test_control_and_data_frames_are_skipped(self):
+        for frame_type in (1, 2, 3):
+            with self.subTest(type=frame_type):
+                self.assertEqual(
+                    self._classify(type_=frame_type, subtype=8,
+                                   addr2="aa:bb:cc:dd:ee:ff"),
+                    (None, ""),
+                )
+
+    def test_address_falls_back_through_addr3_then_addr1(self):
+        # addr2 unreadable: the frame is still attributable and must not be lost.
+        _label, mac = self._classify(type_=0, subtype=8, addr2=None,
+                                     addr3="11:22:33:44:55:66")
+        self.assertEqual(mac, "11:22:33:44:55:66".upper())
+
+        _label, mac = self._classify(type_=0, subtype=8, addr2=None, addr3=None,
+                                     addr1="99:88:77:66:55:44")
+        self.assertEqual(mac, "99:88:77:66:55:44".upper())
+
+    def test_frame_with_no_readable_address_is_still_classified(self):
+        label, mac = self._classify(type_=0, subtype=13)
+        self.assertEqual(label, "ACTION")
+        self.assertEqual(mac, "")
+
+    def test_missing_or_malformed_dot11_layer_returns_no_frame(self):
+        class NoDot11:
+            def getlayer(self, layer):
+                return None
+
+        self.assertEqual(night_sniffer_v3.classify_frame(NoDot11()), (None, ""))
+        # A control field that will not coerce must not raise: Scapy closes the
+        # capture socket on any exception escaping the packet callback.
+        self.assertEqual(self._classify(type_=None, subtype=8), (None, ""))
+        self.assertEqual(self._classify(type_=0, subtype="junk"), (None, ""))
+
 
 class NightSnifferV3ReplayClockTests(unittest.TestCase):
     """The --pcap replay path must timestamp frames from the capture, not the run.
