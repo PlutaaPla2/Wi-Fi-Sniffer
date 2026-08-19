@@ -151,14 +151,16 @@ class NightSnifferV3SessionTests(unittest.TestCase):
 
 class NightSnifferV3IeTests(unittest.TestCase):
     def test_raw_ie_parser_keeps_vendor_ie_after_unknown_ie(self):
-        class FakeElt:
-            def __bytes__(self):
-                return b"\x00\x00\xff\x01\x04\xdd\x03\x00\x50\xf2"
+        # tag 0 (empty), tag 255 (unknown to Scapy's element chain), tag 221.
+        # Scapy stopped at tag 255 and lost the vendor element behind it.
+        elements = b"\x00\x00\xff\x01\x04\xdd\x03\x00\x50\xf2"
+        header = (b"\x40\x00\x00\x00" + b"\xff" * 6 + b"\x11" * 6
+                  + b"\x22" * 6 + b"\x00\x00")
 
         class FakePkt:
             def getlayer(self, layer):
-                if layer is night_sniffer_v3.Dot11Elt:
-                    return FakeElt()
+                if layer is night_sniffer_v3.Dot11:
+                    return types.SimpleNamespace(original=header + elements)
                 return None
 
         details = night_sniffer_v3.extract_ie_details(FakePkt())
@@ -170,10 +172,13 @@ class NightSnifferV3IeTests(unittest.TestCase):
 class NightSnifferV3PacketHandlerTests(unittest.TestCase):
     def test_sequence_number_reaches_session_and_csv_seq_column(self):
         class FakePacket:
-            dot11 = types.SimpleNamespace(SC=(321 << 4) | 7)
+            dot11 = types.SimpleNamespace(SC=(321 << 4) | 7, original=b"")
 
             def haslayer(self, layer):
                 return layer is night_sniffer_v3.Dot11
+
+            def getlayer(self, layer):
+                return self.dot11 if layer is night_sniffer_v3.Dot11 else None
 
             def __getitem__(self, layer):
                 return self.dot11
@@ -201,26 +206,27 @@ class NightSnifferV3PacketHandlerTests(unittest.TestCase):
         ) as append_row, patch.object(
             night_sniffer_v3, "dump_ie_details"
         ), patch("builtins.print"):
-            night_sniffer_v3.handle_packet(FakePacket())
+            night_sniffer_v3._process_frame(FakePacket())
 
         # seq is passed to track_session as the 10th positional arg (index 9);
         # Phase 1 appends current_ap/listen_interval/security_tier after it.
         self.assertEqual(track_session.call_args.args[9], 321)
-        # In the CSV row seq sits at the Seq_Num column, before the seven
-        # Phase 1 frame-body columns, i.e. 8th from the end.
-        self.assertEqual(append_row.call_args.args[0][-8], 321)
-        self.assertEqual(
-            night_sniffer_v3.CSV_FIELDS[-8], "Seq_Num"
-        )
+        # Looked up by name rather than by offset from the end: appending a
+        # column must not be able to break this assertion silently.
+        seq_col = night_sniffer_v3.CSV_FIELDS.index("Seq_Num")
+        self.assertEqual(append_row.call_args.args[0][seq_col], 321)
 
     def test_management_frame_without_an_address_is_logged_not_dropped(self):
         """A frame dumpcap would have kept must reach the CSV even unattributable."""
 
         class FakePacket:
-            dot11 = types.SimpleNamespace(SC=(1 << 4) | 0)
+            dot11 = types.SimpleNamespace(SC=(1 << 4) | 0, original=b"")
 
             def haslayer(self, layer):
                 return layer is night_sniffer_v3.Dot11
+
+            def getlayer(self, layer):
+                return self.dot11 if layer is night_sniffer_v3.Dot11 else None
 
             def __getitem__(self, layer):
                 return self.dot11
@@ -246,7 +252,7 @@ class NightSnifferV3PacketHandlerTests(unittest.TestCase):
         ) as append_row, patch.object(
             night_sniffer_v3, "dump_ie_details"
         ), patch("builtins.print"):
-            night_sniffer_v3.handle_packet(FakePacket())
+            night_sniffer_v3._process_frame(FakePacket())
 
         append_row.assert_called_once()
         row = append_row.call_args.args[0]
@@ -425,6 +431,195 @@ class NightSnifferV3ReplayClockTests(unittest.TestCase):
         session = night_sniffer_v3.active_sessions[1]
         self.assertEqual(session.first_ts, 9000.0)
         self.assertEqual(session.last_ts, 9000.0)
+
+
+def _wire(subtype, body=b"", addr2=b"\x11" * 6):
+    """Wire bytes of a management frame: 24-byte header then body."""
+    return (bytes([(subtype << 4) & 0xF0, 0x00]) + b"\x00\x00"
+            + b"\xff" * 6 + addr2 + b"\x22" * 6 + b"\x00\x00" + body)
+
+
+def _pkt(raw):
+    class FakePkt:
+        def getlayer(self, layer, ID=None):
+            if layer is night_sniffer_v3.Dot11:
+                return types.SimpleNamespace(original=raw)
+            return None
+
+    return FakePkt()
+
+
+class NightSnifferV3LosslessTests(unittest.TestCase):
+    """No byte of a management frame may be discarded.
+
+    Whether this tool can decode a region yet is a separate question from
+    whether the bytes are kept: an unrecognised Action category or a reserved
+    subtype must still reach the reports verbatim, so it can be decoded later
+    without re-capturing.
+    """
+
+    def test_regions_reconstruct_the_frame_exactly(self):
+        for subtype, body in (
+            (8, bytes(12) + b"\x00\x03abc"),        # beacon, fixed + elements
+            (4, b"\x00\x03abc"),                    # probe request, elements only
+            (7, b"\xde\xad\xbe\xef"),               # reserved, no defined body
+            (13, b"\x7f\x00\x00\x17\xf2\x01"),      # action, unknown category
+            (11, bytes(6)),                         # auth, fixed only
+        ):
+            with self.subTest(subtype=subtype):
+                raw = _wire(subtype, body)
+                parts = night_sniffer_v3._frame_parts(_pkt(raw))
+                self.assertEqual(parts.frame, raw)
+                self.assertEqual(parts.body, body)
+
+    def test_reserved_subtype_body_is_kept_as_unparsed(self):
+        parts = night_sniffer_v3._frame_parts(_pkt(_wire(7, b"\xde\xad\xbe\xef")))
+        self.assertEqual(parts.elements, b"")
+        self.assertEqual(parts.unparsed, b"\xde\xad\xbe\xef")
+
+    def test_unknown_action_category_keeps_its_body(self):
+        # Category 127 (Vendor Specific) has no entry in ACTION_ELEMENT_OFFSETS.
+        body = b"\x7f\x00" + b"\x00\x17\xf2\x99\x01\x02"
+        parts = night_sniffer_v3._frame_parts(_pkt(_wire(13, body)))
+        self.assertEqual(parts.fixed, b"\x7f\x00")
+        self.assertEqual(parts.elements, b"")
+        self.assertEqual(parts.unparsed, b"\x00\x17\xf2\x99\x01\x02")
+
+    def test_trailing_bytes_after_a_truncated_element_are_kept(self):
+        # An element claiming more bytes than remain: the good elements before
+        # it are still parsed and the remainder is preserved, not dropped.
+        body = b"\x00\x03abc" + b"\x2d\x1a\xff"
+        parts = night_sniffer_v3._frame_parts(_pkt(_wire(4, body)))
+        self.assertEqual(parts.elements, b"\x00\x03abc")
+        self.assertEqual(parts.unparsed, b"\x2d\x1a\xff")
+
+    def test_ie_report_rows_reconstruct_the_body(self):
+        import csv as csv_mod
+        import os
+        import tempfile
+
+        body = bytes(12) + b"\x00\x03abc" + b"\x2d\x1a\xff"
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "ie.csv")
+            with patch.object(night_sniffer_v3, "IE_DETAILS_FILE", path):
+                night_sniffer_v3.dump_ie_details(
+                    _pkt(_wire(8, body)), "ts", "BEACON", "AA:BB"
+                )
+                night_sniffer_v3.close_output_files()
+                with open(path, newline="") as fh:
+                    rows = list(csv_mod.reader(fh))
+
+        # Rebuild the body from the report. Element rows store the payload in
+        # IE_Raw_Hex with the tag and length in their own columns, so an element
+        # is IE_ID + IE_Length + IE_Raw_Hex; the pseudo-ID rows are raw regions
+        # and contribute their hex alone. Every byte must be accounted for.
+        rebuilt = b""
+        for row in rows:
+            ie_id, ie_len, ie_hex = int(row[4]), int(row[6]), row[7]
+            if ie_id >= 0:
+                rebuilt += bytes([ie_id, ie_len])
+            rebuilt += bytes.fromhex(ie_hex)
+        self.assertEqual(rebuilt, body)
+
+        names = [r[5] for r in rows]
+        self.assertIn("Fixed Parameters", names)
+        self.assertIn("Unparsed Bytes", names)
+
+    def test_frame_hex_column_holds_the_whole_frame(self):
+        self.assertEqual(night_sniffer_v3.CSV_FIELDS[-1], "Frame_Hex")
+        raw = _wire(13, b"\x7f\x00\xde\xad")
+        parts = night_sniffer_v3._frame_parts(_pkt(raw))
+        self.assertEqual(parts.frame.hex(), raw.hex())
+
+
+class NightSnifferV3FrameGuardTests(unittest.TestCase):
+    """One malformed frame must cost one frame, never the capture.
+
+    Scapy's sniff loop closes the capture socket on any exception escaping the
+    packet callback, which main() then reads as the adapter dropping out of
+    monitor mode — a reset, RETRY_DELAY seconds of blindness, and the run ending
+    after MAX_RETRIES of them.
+    """
+
+    def setUp(self):
+        self._count = night_sniffer_v3._frame_error_count
+        night_sniffer_v3._frame_error_count = 0
+
+    def tearDown(self):
+        night_sniffer_v3._frame_error_count = self._count
+
+    def test_exception_is_absorbed_and_counted(self):
+        def boom(_pkt):
+            raise ValueError("malformed frame")
+
+        with patch.object(night_sniffer_v3, "_process_frame", side_effect=boom):
+            night_sniffer_v3.handle_packet(object())   # must not raise
+        self.assertEqual(night_sniffer_v3._frame_error_count, 1)
+
+    def test_logging_is_capped_but_counting_continues(self):
+        def boom(_pkt):
+            raise ValueError("malformed frame")
+
+        limit = night_sniffer_v3.MAX_FRAME_ERROR_LOGS
+        with patch.object(night_sniffer_v3, "_process_frame", side_effect=boom), \
+                patch.object(night_sniffer_v3.log, "warning") as warn:
+            for _ in range(limit + 10):
+                night_sniffer_v3.handle_packet(object())
+        self.assertEqual(night_sniffer_v3._frame_error_count, limit + 10)
+        self.assertEqual(warn.call_count, limit)
+
+    def test_keyboard_interrupt_still_stops_the_capture(self):
+        def interrupt(_pkt):
+            raise KeyboardInterrupt
+
+        with patch.object(night_sniffer_v3, "_process_frame", side_effect=interrupt):
+            with self.assertRaises(KeyboardInterrupt):
+                night_sniffer_v3.handle_packet(object())
+
+
+class NightSnifferV3WriterTests(unittest.TestCase):
+    """Report handles are held open instead of reopened once per frame."""
+
+    def setUp(self):
+        import tempfile
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self._paths = (night_sniffer_v3.LOG_FILE, night_sniffer_v3.IE_DETAILS_FILE)
+
+    def tearDown(self):
+        night_sniffer_v3.close_output_files()
+        (night_sniffer_v3.LOG_FILE,
+         night_sniffer_v3.IE_DETAILS_FILE) = self._paths
+        self._tmpdir.cleanup()
+
+    def test_handle_is_reused_then_closed_on_shutdown(self):
+        import os
+
+        path = os.path.join(self._tmpdir.name, "report.csv")
+        first = night_sniffer_v3._writer_for(path)
+        self.assertIs(night_sniffer_v3._writer_for(path), first)
+        night_sniffer_v3.close_output_files()
+        self.assertTrue(first.closed)
+
+    def test_rows_are_flushed_so_a_reader_sees_them_immediately(self):
+        # tail -f during a capture, and a hard power-off, both depend on this.
+        import csv as csv_mod
+        import os
+
+        path = os.path.join(self._tmpdir.name, "report.csv")
+        with patch.object(night_sniffer_v3, "LOG_FILE", path):
+            night_sniffer_v3._append_csv_row(["a", "b"])
+            with open(path, newline="") as fh:
+                self.assertEqual(list(csv_mod.reader(fh)), [["a", "b"]])
+
+    def test_truncating_the_ie_report_drops_the_cached_handle(self):
+        import os
+
+        path = os.path.join(self._tmpdir.name, "ie.csv")
+        with patch.object(night_sniffer_v3, "IE_DETAILS_FILE", path):
+            night_sniffer_v3._writer_for(path)
+            night_sniffer_v3.setup_ie_csv()
+            # A stale append handle would write past a hole at the old offset.
+            self.assertNotIn(path, night_sniffer_v3._open_writers)
 
 
 class NightSnifferV3OutputDirTests(unittest.TestCase):

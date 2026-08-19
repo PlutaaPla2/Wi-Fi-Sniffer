@@ -88,74 +88,65 @@ class FakePacket:
         return None
 
 
-class VendorNode:
-    """One link in a fake Dot11EltVendorSpecific chain."""
-
-    def __init__(self, oui, info=b"", next_node=None):
-        self.oui = oui
-        self.info = info
-        self._next = next_node
-
-    @property
-    def payload(self):
-        return self
-
-    def getlayer(self, layer):
-        return self._next
+def tlv(ie_id, data=b""):
+    """One information element as it appears on the wire: [ID][len][data]."""
+    return bytes([ie_id, len(data)]) + data
 
 
-class IdentityPacket:
-    """Fake packet for get_correlation_identity()."""
+def vendor_tlv(oui, vendor_type=None, extra=b""):
+    """A Vendor Specific element (221). ``oui`` is a 3-byte int, e.g. 0x0050F2.
 
-    def __init__(self, addr2=None, addr3=None, has_elt=True,
-                 vendor_chain=None, ch_list=None):
+    The vendor type is the octet after the OUI, which is what distinguishes a
+    WMM element (00:50:F2 type 2) from a WPS one (type 4).
+    """
+    payload = oui.to_bytes(3, "big")
+    if vendor_type is not None:
+        payload += bytes([vendor_type])
+    return tlv(221, payload + extra)
+
+
+def mgmt_wire(subtype=4, body=b"", elements=b"",
+              addr1="ff:ff:ff:ff:ff:ff",
+              addr2="00:00:00:00:00:00",
+              addr3="00:00:00:00:00:00"):
+    """Wire bytes of a management frame: real 24-byte header, body, elements."""
+    def mac(text):
+        return bytes(int(part, 16) for part in text.split(":"))
+
+    frame_control = bytes([(subtype << 4) & 0xF0, 0x00])
+    return (frame_control + b"\x00\x00"
+            + mac(addr1) + mac(addr2) + mac(addr3) + b"\x00\x00"
+            + body + elements)
+
+
+class WirePacket:
+    """Fake packet exposing captured bytes, the way the element walk reads them.
+
+    The helpers here deliberately build real TLV bytes rather than mimicking a
+    Scapy layer object. The previous fixtures supplied a vendor element's
+    payload without its OUI, which does not match what Scapy returns, and that
+    mismatch let a defect in the WMM/WPS guard pass its own test.
+    """
+
+    def __init__(self, subtype=4, body=b"", elements=b"", addr2=None, addr3=None):
         self.addr2 = addr2
         self.addr3 = addr3
-        self._has_elt = has_elt
-        self._vendor_chain = vendor_chain
-        self._ch_list = ch_list
+        self._raw = mgmt_wire(
+            subtype, body, elements,
+            addr2=addr2 or "00:00:00:00:00:00",
+            addr3=addr3 or "00:00:00:00:00:00",
+        )
+
+    def getlayer(self, layer, ID=None):
+        if layer is ns.Dot11:
+            return types.SimpleNamespace(original=self._raw)
+        return None
 
     def haslayer(self, layer):
-        return self._has_elt
-
-    def getlayer(self, layer, ID=None):
-        if layer is ns.Dot11EltVendorSpecific:
-            return self._vendor_chain
-        if layer is ns.Dot11Elt and ID == 50:
-            if self._ch_list is None:
-                return None
-            tag = types.SimpleNamespace(info=self._ch_list)
-            return tag
-        return None
+        return layer is ns.Dot11
 
 
-class SsidPacket:
-    """Fake packet for extract_ssid()."""
 
-    def __init__(self, info=None, elt_info=None):
-        if info is not None:
-            self.info = info
-        self._elt_info = elt_info
-
-    def getlayer(self, layer, ID=None):
-        if self._elt_info is None:
-            return None
-        return types.SimpleNamespace(info=self._elt_info)
-
-
-class RawIePacket:
-    """Fake packet whose Dot11Elt layer serializes to raw TLV bytes."""
-
-    def __init__(self, raw_bytes: bytes):
-        self._raw_bytes = raw_bytes
-
-    def getlayer(self, layer):
-        if layer is ns.Dot11Elt:
-            return self
-        return None
-
-    def __bytes__(self):
-        return self._raw_bytes
 
 
 # ---------------------------------------------------------------------------
@@ -420,17 +411,28 @@ class ClassifyFrameTests(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 class ExtractSsidTests(unittest.TestCase):
-    def test_ignores_non_ssid_top_level_info_attribute(self):
-        pkt = SsidPacket(info=b"not-an-ssid")
+    def test_reads_only_the_tag_zero_element(self):
+        # Elements present, but none of them is an SSID.
+        pkt = WirePacket(elements=tlv(1, b"\x82\x84") + vendor_tlv(0x0017F2, 0x0A))
         self.assertEqual(ns.extract_ssid(pkt, "(fallback)"), "(fallback)")
 
-    def test_falls_back_to_ssid_information_element(self):
-        pkt = SsidPacket(info=b"", elt_info=b"OfficeWifi")
+    def test_reads_the_ssid_information_element(self):
+        pkt = WirePacket(elements=tlv(0, b"OfficeWifi") + tlv(1, b"\x82"))
         self.assertEqual(ns.extract_ssid(pkt, "(fallback)"), "OfficeWifi")
 
     def test_falls_back_to_default_when_nothing_present(self):
-        pkt = SsidPacket(info=b"", elt_info=None)
-        self.assertEqual(ns.extract_ssid(pkt, "(Wildcard)"), "(Wildcard)")
+        self.assertEqual(ns.extract_ssid(WirePacket(), "(Wildcard)"), "(Wildcard)")
+
+    def test_zero_length_ssid_uses_the_fallback(self):
+        # A wildcard probe or a hidden network: the element is there but empty.
+        pkt = WirePacket(elements=tlv(0, b"") + tlv(1, b"\x82"))
+        self.assertEqual(ns.extract_ssid(pkt, "(Hidden SSID)"), "(Hidden SSID)")
+
+    def test_reads_an_ssid_past_the_fixed_body_of_a_beacon(self):
+        # Beacons carry 12 bytes of fixed fields before the first element; the
+        # walk has to skip them rather than treat them as element bytes.
+        pkt = WirePacket(subtype=8, body=bytes(12), elements=tlv(0, b"OfficeWifi"))
+        self.assertEqual(ns.extract_ssid(pkt, "(fallback)"), "OfficeWifi")
 
 
 # ---------------------------------------------------------------------------
@@ -439,40 +441,48 @@ class ExtractSsidTests(unittest.TestCase):
 
 class CorrelationIdentityTests(unittest.TestCase):
     def test_apple_vendor_tag_wins_regardless_of_mac_oui(self):
-        pkt = IdentityPacket(
-            addr2="11:22:33:44:55:66", vendor_chain=VendorNode(0x0017F2)
-        )
+        pkt = WirePacket(addr2="11:22:33:44:55:66",
+                         elements=vendor_tlv(0x0017F2, 0x0A))
         self.assertEqual(ns.get_correlation_identity(pkt), "Apple Device (Unknown)")
 
     def test_region_is_th_eu_when_channel_12_or_13_supported(self):
-        pkt = IdentityPacket(
-            addr2="11:22:33:44:55:66",
-            vendor_chain=VendorNode(0x0017F2),
-            ch_list=[1, 2, 12],
-        )
+        pkt = WirePacket(addr2="11:22:33:44:55:66",
+                         elements=vendor_tlv(0x0017F2, 0x0A) + tlv(50, bytes([1, 2, 12])))
         self.assertEqual(ns.get_correlation_identity(pkt), "Apple Device (TH/EU)")
 
     def test_wmm_vendor_tag_does_not_imply_windows_or_microsoft(self):
-        pkt = IdentityPacket(
-            addr2="11:22:33:44:55:66",
-            vendor_chain=VendorNode(0x0050F2, info=b"\x02"),
-        )
+        # 00:50:F2 type 2 is WMM, a protocol marker carried by devices from many
+        # manufacturers. It must not be read as a Microsoft device.
+        pkt = WirePacket(addr2="11:22:33:44:55:66",
+                         elements=vendor_tlv(0x0050F2, 0x02, b"\x01\x02"))
         identity = ns.get_correlation_identity(pkt)
         self.assertNotIn("Windows", identity)
         self.assertNotIn("Microsoft", identity)
 
+    def test_wps_vendor_tag_does_not_imply_microsoft(self):
+        pkt = WirePacket(addr2="11:22:33:44:55:66",
+                         elements=vendor_tlv(0x0050F2, 0x04, b"\x10\x4a"))
+        self.assertNotIn("Microsoft", ns.get_correlation_identity(pkt))
+
+    def test_vendor_element_after_an_unknown_element_is_still_seen(self):
+        # Scapy's element chain stopped at an element it could not dissect, and
+        # vendor elements sit late in a frame. The raw walk reaches them.
+        pkt = WirePacket(addr2="11:22:33:44:55:66",
+                         elements=tlv(201, bytes(12)) + vendor_tlv(0x0017F2, 0x0A))
+        self.assertEqual(ns.get_correlation_identity(pkt), "Apple Device (Unknown)")
+
     def test_iot_vendor_from_mac_oui_alone(self):
-        pkt = IdentityPacket(addr2="84:E1:BA:11:22:33", vendor_chain=None)
+        pkt = WirePacket(addr2="84:E1:BA:11:22:33")
         self.assertEqual(
             ns.get_correlation_identity(pkt), "Smart Home/IoT (Tuya Smart (IoT))"
         )
 
     def test_known_vendor_without_any_information_elements(self):
-        pkt = IdentityPacket(addr2="50:C7:BF:11:22:33", has_elt=False)
+        pkt = WirePacket(addr2="50:C7:BF:11:22:33")
         self.assertEqual(ns.get_correlation_identity(pkt), "TP-Link (Unknown)")
 
     def test_falls_back_to_addr3_when_addr2_missing(self):
-        pkt = IdentityPacket(addr2=None, addr3="50:C7:BF:11:22:33", has_elt=False)
+        pkt = WirePacket(addr2=None, addr3="50:C7:BF:11:22:33")
         self.assertEqual(ns.get_correlation_identity(pkt), "TP-Link (Unknown)")
 
 
@@ -519,8 +529,7 @@ class DumpIeDetailsTests(unittest.TestCase):
         self._tmpdir.cleanup()
 
     def test_rows_match_ie_sequence_and_decode(self):
-        raw = b"\x00\x02\x41\x42\x03\x01\x06"
-        pkt = RawIePacket(raw)
+        pkt = WirePacket(elements=tlv(0, b"AB") + tlv(3, b"\x06"))
         with patch.object(ns, "IE_DETAILS_FILE", str(self.tmp_file)):
             ns.dump_ie_details(pkt, "2026-01-01 00:00:00", "PROBE", "AA:BB:CC:DD:EE:FF")
         with open(self.tmp_file, newline="") as fh:
@@ -535,7 +544,7 @@ class DumpIeDetailsTests(unittest.TestCase):
         self.assertEqual(rows[1][8], "Channel 6")
 
     def test_no_information_elements_writes_nothing(self):
-        pkt = RawIePacket(b"")
+        pkt = WirePacket()
         with patch.object(ns, "IE_DETAILS_FILE", str(self.tmp_file)):
             ns.dump_ie_details(pkt, "2026-01-01 00:00:00", "BEACON", "AA:BB:CC:DD:EE:FF")
         self.assertFalse(self.tmp_file.exists())
@@ -560,9 +569,11 @@ class CsvSetupTests(unittest.TestCase):
             with open(self.tmp_file, newline="") as fh:
                 rows = list(csv.reader(fh))
         self.assertEqual(rows, [ns.CSV_FIELDS])
-        # Phase 1 appended the frame-body columns after Seq_Num.
-        self.assertEqual(ns.CSV_FIELDS[-8], "Seq_Num")
-        self.assertEqual(ns.CSV_FIELDS[-1], "Direction")
+        # Frame_Hex is last so that appending it did not move any column
+        # above it; everything else is addressed by name.
+        self.assertEqual(ns.CSV_FIELDS[-1], "Frame_Hex")
+        for column in ("Seq_Num", "Direction", "Reason_Code"):
+            self.assertIn(column, ns.CSV_FIELDS)
 
     def test_setup_csv_does_not_clobber_existing_file(self):
         self.tmp_file.write_text("not,a,header\n1,2,3\n")

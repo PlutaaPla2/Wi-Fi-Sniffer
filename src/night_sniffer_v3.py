@@ -17,13 +17,12 @@ import subprocess
 from dataclasses import dataclass, field
 from scapy.all import sniff
 from scapy.layers.dot11 import (
-    # Dot11 is the classifier's only entry point now — subtypes are read from
-    # the frame control field, not matched against per-subtype layer classes.
-    # The layers below are still needed by parse_frame_body() for their fixed
-    # fields, and by the IE helpers.
+    # Dot11 is the only layer the frame walk needs: subtypes come from the
+    # frame control field and elements are read from the captured bytes, not
+    # matched against per-subtype or per-element layer classes. The rest are
+    # still used by parse_frame_body() for their fixed fields.
     Dot11, Dot11AssoReq, Dot11ReassoReq,
-    Dot11Auth, Dot11Deauth, Dot11Disas, RadioTap,
-    Dot11Elt, Dot11EltVendorSpecific
+    Dot11Auth, Dot11Deauth, Dot11Disas, RadioTap
 )
 from mac_vendor_lookup import MacLookup
 
@@ -95,6 +94,28 @@ PROBE_SETTLE       = 0.05   # Seconds to let the driver settle between probes
 MAX_RETRIES  = 10   # maximum reconnect attempts before giving up
 RETRY_DELAY  = 3    # seconds to wait between each attempt
 
+# ── Capture filter ───────────────────────────────────────────────────────────
+# Applied by libpcap in the kernel, matching scripts/run_dumpcap.sh. Without it
+# every data frame on the channel is copied into userspace only to be discarded
+# in Python, and that wasted throughput is what overflows the capture ring under
+# load — dropping management frames we wanted, with no counter to show it.
+#
+# This narrows what the process ever sees, so it sits inside the passive-capture
+# constraint rather than against it. Set to None to capture unfiltered; the code
+# falls back to unfiltered automatically if libpcap cannot compile the filter
+# for the interface's link type, which is what happens when the adapter is not
+# actually in monitor mode.
+CAPTURE_BPF_FILTER = "type mgt"
+
+# A malformed frame must cost one frame, not the capture. Scapy catches any
+# exception escaping the packet callback by closing the capture socket, which
+# this script then reads as the adapter dropping out of monitor mode — costing
+# RETRY_DELAY seconds and a monitor-mode reset, and giving up entirely after
+# MAX_RETRIES of them. handle_packet() therefore swallows and counts instead.
+# The first few are logged in full; after that only the count is kept, so a
+# systematically bad frame cannot flood the log.
+MAX_FRAME_ERROR_LOGS = 5
+
 # ── Management frame subtypes ────────────────────────────────────────────────
 # Every 802.11 management subtype (frame control type == 0), IEEE 802.11-2020
 # 9.2.4.1.3, mapped to the Pkt_Type label written to the CSV.
@@ -134,6 +155,65 @@ MGMT_SUBTYPE_LABELS: dict[int, str] = {
     13: "ACTION",
     14: "ACTION_NOACK",
     15: "MGMT_15",
+}
+
+# ── 802.11 frame geometry ────────────────────────────────────────────────────
+# Where a frame's information elements begin, measured from the frame itself
+# rather than inferred from Scapy's layer chain.
+#
+# Scapy binds an element layer to only some subtypes, so anchoring the element
+# walk on getlayer(Dot11Elt) made the elements of every other subtype
+# unreachable — an Action frame dissects as Dot11/Dot11Action/Raw and yielded
+# nothing at all. Computing the offset from the frame's own header works for
+# every subtype and does not depend on Scapy dissecting the body correctly.
+MGMT_HEADER_LEN = 24   # frame control(2) duration(2) addr1(6) addr2(6) addr3(6) seq(2)
+HT_CONTROL_LEN  = 4    # present only when the +HTC/Order bit is set
+FCS_LEN         = 4    # trailing checksum, when radiotap says one is present
+
+# Length of the fixed (non-element) part of each management frame body,
+# IEEE 802.11-2020 9.3.3. Subtypes absent from this table — the reserved 7 and
+# 15 — have no defined body, so no elements are read from them.
+MGMT_FIXED_BODY_LEN: dict[int, int] = {
+    0:  4,   # Assoc Req      capability(2) listen interval(2)
+    1:  6,   # Assoc Resp     capability(2) status(2) AID(2)
+    2:  10,  # Reassoc Req    capability(2) listen interval(2) current AP(6)
+    3:  6,   # Reassoc Resp   capability(2) status(2) AID(2)
+    4:  0,   # Probe Req      elements only
+    5:  12,  # Probe Resp     timestamp(8) beacon interval(2) capability(2)
+    6:  10,  # Timing Adv     timestamp(8) capability(2)
+    8:  12,  # Beacon         timestamp(8) beacon interval(2) capability(2)
+    9:  0,   # ATIM           no body
+    10: 2,   # Disassoc       reason code(2)
+    11: 6,   # Auth           algorithm(2) sequence(2) status(2)
+    12: 2,   # Deauth         reason code(2)
+}
+
+# Action frames are the one case where the offset cannot be derived from the
+# subtype alone: the body is Category(1) + Action(1) + category-specific fixed
+# fields, and only some categories are followed by elements. Keyed by
+# (category, action), the value being the offset of the first element from the
+# start of the body.
+#
+# Only combinations whose fixed fields are unconditional appear here. WNM BSS
+# Transition (category 10, actions 7 and 8) is deliberately absent: its fixed
+# part has optional fields whose presence depends on flags earlier in the same
+# frame, so a fixed offset would be wrong for some frames and right for others.
+#
+# Marked *verify* against a real capture — these come from the standard, not
+# from measurement. A wrong entry cannot corrupt the CSV: _action_element_bytes
+# accepts a candidate only if the walk tiles it exactly, so a bad offset yields
+# no elements rather than invented ones.
+ACTION_ELEMENT_OFFSETS: dict[tuple[int, int], int] = {
+    (5, 0):  5,   # Radio Measurement Request   +token(1) repetitions(2)
+    (5, 1):  3,   # Radio Measurement Report    +token(1)
+    (5, 2):  5,   # Link Measurement Request    +token(1) tx power(1) max power(1)
+    (5, 3):  3,   # Link Measurement Report     +token(1), TPC report is an element
+    (5, 4):  3,   # Neighbor Report Request     +token(1)
+    (5, 5):  3,   # Neighbor Report Response    +token(1)
+    (6, 1):  14,  # FT Request                  +STA(6) target AP(6)
+    (6, 2):  16,  # FT Response                 +STA(6) target AP(6) status(2)
+    (6, 3):  14,  # FT Confirm                  +STA(6) target AP(6)
+    (6, 4):  16,  # FT Ack                      +STA(6) target AP(6) status(2)
 }
 
 # Frame types that feed session tracking and the device-count model. This is
@@ -180,7 +260,19 @@ CSV_FIELDS = [
     "Capabilities", "Note", "Session_Note", "Seq_Num",
     "Listen_Interval", "Cap_Info", "Current_AP",
     "Security_Tier", "Auth_Status", "Reason_Code", "Direction",
+    # The complete 802.11 frame as captured, hex-encoded, checksum included.
+    # Every other column is derived from these bytes, so anything this tool
+    # cannot decode yet is still recoverable from the log afterwards without
+    # re-capturing. Kept last so column positions above it never move.
+    # Set --raw-frames off to leave it empty when log size matters.
+    "Frame_Hex",
 ]
+
+# Whether Frame_Hex is populated. Management frames only, which is the same
+# scope scripts/run_dumpcap.sh already writes to pcap_files/ — this adds no new
+# collection surface, it keeps the bytes alongside the decoded columns.
+# Set from the --raw-frames CLI flag in main().
+CAPTURE_RAW_FRAMES = True
 
 # Column layout for the per-IE breakdown file (one row per information element).
 IE_CSV_FIELDS = [
@@ -217,6 +309,42 @@ IE_NAMES: dict[int, str] = {
     195: "VHT Tx Power Envelope",
     221: "Vendor Specific",
     255: "Element Extension",
+}
+
+# Pseudo IE IDs for the parts of a frame body that are not information
+# elements. Negative so they can never collide with a real 8-bit element ID,
+# and so `IE_ID < 0` selects every non-element row in a report.
+PSEUDO_IE_FIXED    = -1   # fixed parameters ahead of the element region
+PSEUDO_IE_UNPARSED = -2   # bytes with no known layout, preserved verbatim
+
+# Action frame categories, IEEE 802.11-2020 9.4.1.11. Used to label the fixed
+# parameters of an Action frame in the per-IE report — the category is the most
+# informative byte in the frame and would otherwise only exist as raw hex.
+ACTION_CATEGORY_NAMES: dict[int, str] = {
+    0:  "Spectrum Management",
+    1:  "QoS",
+    2:  "DLS",
+    3:  "Block Ack",
+    4:  "Public",
+    5:  "Radio Measurement",
+    6:  "Fast BSS Transition",
+    7:  "HT",
+    8:  "SA Query",
+    9:  "Protected Dual of Public Action",
+    10: "WNM",
+    11: "Unprotected WNM",
+    12: "TDLS",
+    13: "Mesh",
+    14: "Multihop",
+    15: "Self-protected",
+    16: "DMG",
+    17: "Wi-Fi Alliance",
+    18: "Fast Session Transfer",
+    19: "Robust AV Streaming",
+    20: "Unprotected DMG",
+    21: "VHT",
+    126: "Vendor Specific Protected",
+    127: "Vendor Specific",
 }
 
 # ── Fingerprint algorithm version ────────────────────────────────────────────
@@ -357,8 +485,42 @@ def apply_output_dir(out_dir: str) -> None:
     SUMMARY_DIR     = out_dir
 
 
+# ── Output file handles ──────────────────────────────────────────────────────
+# Both reports were being opened, written and closed once per frame — four extra
+# syscalls per frame on an SD card, at beacon rates. The handles are held open
+# instead and flushed after every row, so `tail -f` and a hard power-off both
+# still see every row that was written.
+_open_writers: dict[str, "object"] = {}
+_writer_lock = threading.Lock()
+
+
+def _writer_for(path: str):
+    """Return a cached append-mode handle for ``path``, opening it if needed."""
+    handle = _open_writers.get(path)
+    if handle is None or handle.closed:
+        handle = open(path, "a", newline="")
+        _open_writers[path] = handle
+    return handle
+
+
+def _close_writer(path: str) -> None:
+    """Drop any cached handle for ``path`` so the file can be re-created."""
+    handle = _open_writers.pop(path, None)
+    if handle is not None and not handle.closed:
+        handle.close()
+
+
+def close_output_files() -> None:
+    """Flush and close every report handle. Called once on the way out."""
+    with _writer_lock:
+        for path in list(_open_writers):
+            _close_writer(path)
+
+
 def setup_csv() -> None:
     """Create CSV with header row if the file does not yet exist."""
+    with _writer_lock:
+        _close_writer(LOG_FILE)
     if not os.path.exists(LOG_FILE):
         with open(LOG_FILE, "w", newline="") as fh:
             csv.writer(fh).writerow(CSV_FIELDS)
@@ -373,6 +535,10 @@ def setup_ie_csv() -> None:
     mirroring the daily summary. That keeps the two reports aligned for
     cross-checking devices seen in the same session.
     """
+    # Drop any cached append handle first: truncating the file underneath one
+    # would leave later rows writing past a hole at the old offset.
+    with _writer_lock:
+        _close_writer(IE_DETAILS_FILE)
     with open(IE_DETAILS_FILE, "w", newline="") as fh:
         csv.writer(fh).writerow(IE_CSV_FIELDS)
 
@@ -659,29 +825,153 @@ def probe_channels(iface: str, channels: list[int]) -> list[int]:
 # Packet fingerprinting
 # ---------------------------------------------------------------------------
 
+def _walk_tlvs(buf: bytes) -> tuple[list[tuple[int, bytes]], int]:
+    """
+    Parse ``buf`` as a run of [ID][len][data] information elements.
+
+    Returns the elements found and how many bytes they consumed. The caller
+    compares that against ``len(buf)`` to see whether the region tiled cleanly:
+    anything left over is a partial element from a snaplen-truncated capture, or
+    a region that is not element-structured at all. Either way the leftover
+    bytes are the caller's to keep — this function never decides they are
+    uninteresting.
+    """
+    elements: list[tuple[int, bytes]] = []
+    i = 0
+    while i + 2 <= len(buf):
+        ie_len = buf[i + 1]
+        end    = i + 2 + ie_len
+        if end > len(buf):
+            break
+        elements.append((buf[i], buf[i + 2:end]))
+        i = end
+    return elements, i
+
+
+@dataclass(frozen=True)
+class FrameParts:
+    """
+    Every byte of a captured frame, split into regions. Nothing is discarded.
+
+    ``fixed + elements + unparsed`` always reconstructs the frame body exactly,
+    and ``header + body + fcs`` reconstructs the whole frame. Where the layout
+    is unknown — a reserved subtype, an Action category with no entry in
+    ACTION_ELEMENT_OFFSETS — the bytes land in ``unparsed`` rather than being
+    dropped, so they still reach the reports and can be decoded later.
+    """
+    subtype:  int                # -1 when the frame is not readable management
+    header:   bytes = b""        # MAC header, including HT Control when present
+    fixed:    bytes = b""        # fixed (non-element) body fields
+    elements: bytes = b""        # region successfully parsed as elements
+    unparsed: bytes = b""        # everything not attributed above
+    fcs:      bytes = b""        # trailing checksum, when radiotap flagged one
+
+    @property
+    def body(self) -> bytes:
+        """The complete frame body, however much of it could be attributed."""
+        return self.fixed + self.elements + self.unparsed
+
+    @property
+    def frame(self) -> bytes:
+        """The complete frame as captured, checksum included."""
+        return self.header + self.body + self.fcs
+
+
+def _split_action_body(body: bytes) -> tuple[bytes, bytes, bytes]:
+    """
+    Split an Action frame body into (fixed, elements, unparsed).
+
+    Action bodies are Category(1) + Action(1) + category-specific fixed fields,
+    and only some categories are followed by elements, so the element offset
+    cannot be derived from the subtype alone. When ACTION_ELEMENT_OFFSETS has no
+    entry, or its entry does not fit the frame, the remainder is returned as
+    ``unparsed`` — kept verbatim for later decoding rather than thrown away.
+    """
+    if len(body) < 2:
+        return body, b"", b""
+
+    offset = ACTION_ELEMENT_OFFSETS.get((body[0], body[1]))
+    if offset is not None and offset <= len(body):
+        candidate = body[offset:]
+        _found, consumed = _walk_tlvs(candidate)
+        # The offset is the one input here that comes from a table rather than
+        # from the frame, so it must earn its keep: accept it only if it tiles
+        # exactly, otherwise treat the region as unparsed rather than invent
+        # elements from a wrong offset.
+        if consumed == len(candidate):
+            return body[:offset], candidate, b""
+
+    return body[:2], b"", body[2:]
+
+
+def _frame_parts(pkt) -> FrameParts:
+    """
+    Split a captured management frame into its regions, losing nothing.
+
+    Works from the captured bytes and the frame's own header rather than Scapy's
+    dissection, so the element region is the same one tshark would parse and the
+    result does not depend on Scapy recognising the subtype.
+    """
+    dot11 = pkt.getlayer(Dot11)
+    if dot11 is None:
+        return FrameParts(subtype=-1)
+
+    # .original is exactly what Scapy was handed for this layer. bytes() is a
+    # fallback for frames built in memory, where the two are equal anyway — and
+    # it is guarded, because a layer that cannot be re-serialised would
+    # otherwise raise inside the packet callback and cost the whole frame.
+    raw = getattr(dot11, "original", b"")
+    if not raw:
+        try:
+            raw = bytes(dot11)
+        except Exception:
+            return FrameParts(subtype=-1)
+
+    # A Dot11FCS layer means radiotap advertised a trailing checksum. It is held
+    # separately so it is neither walked as a bogus element nor lost.
+    fcs = b""
+    if hasattr(dot11, "fcs") and len(raw) >= FCS_LEN:
+        raw, fcs = raw[:-FCS_LEN], raw[-FCS_LEN:]
+
+    # Frame control byte 0: bits 2-3 type, bits 4-7 subtype.
+    if len(raw) < MGMT_HEADER_LEN or (raw[0] >> 2) & 0x03 != 0:
+        return FrameParts(subtype=-1, unparsed=raw, fcs=fcs)
+
+    subtype    = (raw[0] >> 4) & 0x0F
+    header_len = MGMT_HEADER_LEN
+    if raw[1] & 0x80:                       # +HTC/Order: HT Control follows seq
+        header_len += HT_CONTROL_LEN
+    header, body = raw[:header_len], raw[header_len:]
+
+    if subtype in (13, 14):                 # Action, Action No Ack
+        fixed, elements, unparsed = _split_action_body(body)
+    else:
+        fixed_len = MGMT_FIXED_BODY_LEN.get(subtype)
+        if fixed_len is None:
+            # Reserved subtype: the standard defines no body, so nothing can be
+            # attributed. The bytes are still kept and reported.
+            fixed, elements, unparsed = b"", b"", body
+        else:
+            fixed_len = min(fixed_len, len(body))
+            fixed, rest = body[:fixed_len], body[fixed_len:]
+            _found, consumed = _walk_tlvs(rest)
+            elements, unparsed = rest[:consumed], rest[consumed:]
+
+    return FrameParts(subtype, header, fixed, elements, unparsed, fcs)
+
+
 def _iter_ies(pkt):
     """
     Yield ``(ie_id, info_bytes)`` for every 802.11 information element in a frame.
 
-    Walks raw TLV bytes instead of Scapy's Dot11Elt chain — Scapy can stop
-    producing Dot11Elt objects after an unknown element and fall back to Raw,
-    silently dropping later IEs. The raw [ID][len][data] walk recovers all of them.
-    """
-    first_elt = pkt.getlayer(Dot11Elt)
-    if first_elt is None:
-        return
+    ``info_bytes`` is the element's full payload, exactly as it appeared on the
+    wire — for a Vendor Specific element that includes the three OUI bytes.
 
-    raw_bytes = bytes(first_elt)
-    i = 0
-    while i + 1 < len(raw_bytes):
-        ie_id      = raw_bytes[i]
-        ie_len     = raw_bytes[i + 1]
-        data_start = i + 2
-        data_end   = data_start + ie_len
-        if data_end > len(raw_bytes):
-            break
-        yield ie_id, raw_bytes[data_start:data_end]
-        i = data_end
+    Only the element-structured region is yielded. Bytes that are not elements
+    are not lost: they reach the per-IE report through dump_ie_details(), and
+    the whole frame is preserved in the Frame_Hex column.
+    """
+    yield from _walk_tlvs(_frame_parts(pkt).elements)[0]
 
 
 def extract_ie_details(pkt) -> dict[str, str]:
@@ -772,32 +1062,102 @@ def _decode_ie(ie_id: int, info: bytes) -> str:
     return ""
 
 
+def _decode_fixed(subtype: int, fixed: bytes) -> str:
+    """
+    Best-effort label for a frame's fixed parameters, for the per-IE report.
+
+    Only the fields that are cheap and unambiguous are named; the full bytes are
+    in the IE_Raw_Hex column of the same row either way, so anything not decoded
+    here is still recoverable.
+    """
+    try:
+        if subtype in (13, 14) and len(fixed) >= 2:      # Action, Action No Ack
+            category, action = fixed[0], fixed[1]
+            name = ACTION_CATEGORY_NAMES.get(category, f"Category {category}")
+            return f"{name}, action {action}"
+        if subtype in (0, 2) and len(fixed) >= 4:        # (Re)Assoc Request
+            return f"cap 0x{int.from_bytes(fixed[0:2], 'little'):04x}, " \
+                   f"listen interval {int.from_bytes(fixed[2:4], 'little')}"
+        if subtype in (1, 3) and len(fixed) >= 6:        # (Re)Assoc Response
+            return f"cap 0x{int.from_bytes(fixed[0:2], 'little'):04x}, " \
+                   f"status {int.from_bytes(fixed[2:4], 'little')}, " \
+                   f"AID {int.from_bytes(fixed[4:6], 'little')}"
+        if subtype in (5, 8) and len(fixed) >= 12:       # Probe Response, Beacon
+            return f"beacon interval {int.from_bytes(fixed[8:10], 'little')} TU, " \
+                   f"cap 0x{int.from_bytes(fixed[10:12], 'little'):04x}"
+        if subtype == 11 and len(fixed) >= 6:            # Authentication
+            return f"algo {int.from_bytes(fixed[0:2], 'little')}, " \
+                   f"seq {int.from_bytes(fixed[2:4], 'little')}, " \
+                   f"status {int.from_bytes(fixed[4:6], 'little')}"
+        if subtype in (10, 12) and len(fixed) >= 2:      # Disassoc, Deauth
+            return f"reason {int.from_bytes(fixed[0:2], 'little')}"
+    except Exception:
+        return ""
+    return ""
+
+
 def dump_ie_details(pkt, timestamp: str, pkt_type: str, mac_addr: str) -> None:
     """
-    Append one row per 802.11 information element to IE_DETAILS_FILE.
+    Append one row per region of the frame body to IE_DETAILS_FILE.
 
     Where the main recon log records a single row per packet, this breaks each
-    frame down tag-by-tag so the raw content of every IE can be inspected
-    offline — especially useful for the richer association/probe frames.
+    frame down region by region so its raw content can be inspected offline.
+
+    Every byte of the body appears in exactly one row. Information elements get
+    a row each, as before. The fixed parameters ahead of them, and any region
+    that is not element-structured — a reserved subtype's body, an Action
+    category with no offset entry, a snaplen-truncated tail — get their own rows
+    under the pseudo-IDs below, rather than being dropped because nothing here
+    knows how to decode them yet. Concatenating IE_Raw_Hex across a frame's rows
+    reproduces the body exactly.
     """
-    rows = []
-    for index, (ie_id, info) in enumerate(_iter_ies(pkt)):
+    parts = _frame_parts(pkt)
+    rows  = []
+    index = 0
+
+    if parts.fixed:
+        rows.append([
+            timestamp, pkt_type, mac_addr, index, PSEUDO_IE_FIXED,
+            "Fixed Parameters", len(parts.fixed), parts.fixed.hex(),
+            _decode_fixed(parts.subtype, parts.fixed),
+        ])
+        index += 1
+
+    for ie_id, info in _walk_tlvs(parts.elements)[0]:
         rows.append([
             timestamp, pkt_type, mac_addr, index, ie_id,
             IE_NAMES.get(ie_id, f"Unknown({ie_id})"),
             len(info), info.hex(), _decode_ie(ie_id, info),
         ])
+        index += 1
+
+    if parts.unparsed:
+        rows.append([
+            timestamp, pkt_type, mac_addr, index, PSEUDO_IE_UNPARSED,
+            "Unparsed Bytes", len(parts.unparsed), parts.unparsed.hex(),
+            "not element-structured; kept verbatim",
+        ])
+        index += 1
+
     if not rows:
         return
-    with open(IE_DETAILS_FILE, "a", newline="") as fh:
-        csv.writer(fh).writerows(rows)
+    with _writer_lock:
+        handle = _writer_for(IE_DETAILS_FILE)
+        csv.writer(handle).writerows(rows)
+        handle.flush()
 
 
 def extract_ssid(pkt, fallback: str) -> str:
-    """Read an SSID only from the tag-0 information element."""
-    ssid_el = pkt.getlayer(Dot11Elt, ID=0)
-    raw = getattr(ssid_el, "info", b"") if ssid_el else b""
-    return raw.decode("utf-8", errors="ignore") or fallback
+    """
+    Read an SSID only from the tag-0 information element.
+
+    Sourced from the same walk as everything else rather than from Scapy's
+    layer chain, so it reads the SSID of any subtype that carries one.
+    """
+    for ie_id, info in _iter_ies(pkt):
+        if ie_id == 0:
+            return info.decode("utf-8", errors="ignore") or fallback
+    return fallback
 
 
 def get_correlation_identity(pkt) -> str:
@@ -819,36 +1179,43 @@ def get_correlation_identity(pkt) -> str:
     except Exception:
         pass
 
-    if pkt.haslayer(Dot11Elt):
-        el = pkt.getlayer(Dot11EltVendorSpecific)
-        while el:
-            try:
-                raw_oui = el.oui
-                if isinstance(raw_oui, int):
-                    oui_str    = oui_int_to_str(raw_oui)
-                    found_oui  = oui_str
-                    info = getattr(el, "info", b"") or b""
-                    vendor_type = info[0] if info else None
-                    is_wmm_or_wps = (raw_oui, vendor_type) in {
-                        (0x0050F2, 0x02),
-                        (0x0050F2, 0x04),
-                    }
-                    if not is_wmm_or_wps and not (
-                        raw_oui == 0x0050F2 and vendor_type is None
-                    ):
-                        tag_vendor = lookup_oui(oui_str)
-                        if "Unknown" not in tag_vendor:
-                            vendor = tag_vendor
-                    if raw_oui == 0x0017F2:
-                        is_apple = True
-            except Exception:
-                pass
-            el = el.payload.getlayer(Dot11EltVendorSpecific)
-
-        tag50 = pkt.getlayer(Dot11Elt, ID=50)
-        if tag50:
-            ch_list      = list(tag50.info)
-            region       = "TH/EU" if (12 in ch_list or 13 in ch_list) else "US/Global"
+    # Element access goes through the same raw walk as the rest of the file.
+    # Scapy's Dot11EltVendorSpecific chain stops at the first element it cannot
+    # dissect, and vendor elements sit late in a frame — exactly where that
+    # truncation bites. The decision logic below is unchanged: `info` here is
+    # the element's full payload, which is what el.info returned too.
+    for ie_id, info in _iter_ies(pkt):
+        try:
+            if ie_id == 221 and len(info) >= 3:
+                raw_oui    = int.from_bytes(info[:3], "big")
+                oui_str    = oui_int_to_str(raw_oui)
+                found_oui  = oui_str
+                # The vendor type is the octet AFTER the three OUI octets.
+                # This previously read info[0], which is the first byte of the
+                # OUI and therefore never 0x02 or 0x04 — so the WMM/WPS guard
+                # below could never fire and any device advertising WMM or WPS
+                # was reported as "Microsoft (Surface/WPS)". The behaviour
+                # asserted by test_wmm_vendor_tag_does_not_imply_windows_or_
+                # microsoft only held because that test's fake element supplied
+                # info without the OUI.
+                vendor_type = info[3] if len(info) >= 4 else None
+                is_wmm_or_wps = (raw_oui, vendor_type) in {
+                    (0x0050F2, 0x02),
+                    (0x0050F2, 0x04),
+                }
+                if not is_wmm_or_wps and not (
+                    raw_oui == 0x0050F2 and vendor_type is None
+                ):
+                    tag_vendor = lookup_oui(oui_str)
+                    if "Unknown" not in tag_vendor:
+                        vendor = tag_vendor
+                if raw_oui == 0x0017F2:
+                    is_apple = True
+            elif ie_id == 50:
+                ch_list = list(info)
+                region  = "TH/EU" if (12 in ch_list or 13 in ch_list) else "US/Global"
+        except Exception:
+            pass
 
     if is_apple:
         return f"Apple Device ({region})"
@@ -1230,8 +1597,10 @@ def generate_session_report() -> None:
 
 def _append_csv_row(row: list) -> None:
     """Thread-safe append of a single row to the main log file."""
-    with open(LOG_FILE, "a", newline="") as fh:
-        csv.writer(fh).writerow(row)
+    with _writer_lock:
+        handle = _writer_for(LOG_FILE)
+        csv.writer(handle).writerow(row)
+        handle.flush()
 
 
 # ---------------------------------------------------------------------------
@@ -1319,7 +1688,40 @@ def classify_frame(pkt) -> tuple[str | None, str]:
     return label, mac_addr
 
 
+_frame_error_count = 0
+
+
 def handle_packet(pkt) -> None:
+    """
+    Process one captured frame, absorbing any failure it causes.
+
+    This guard is the difference between losing a frame and losing the capture.
+    Scapy's sniff loop wraps the packet callback in a broad ``except Exception``
+    that closes the capture socket and removes it from its socket set; with one
+    interface that ends the loop and ``sniff()`` returns normally, which the
+    retry logic in main() reads as the adapter dropping out of monitor mode. One
+    malformed frame therefore cost a monitor-mode reset and RETRY_DELAY seconds
+    of blindness, and MAX_RETRIES of them ended the run — all reported as a
+    hardware problem.
+
+    ``except Exception`` deliberately does not catch KeyboardInterrupt, so Ctrl+C
+    still stops the capture immediately.
+    """
+    global _frame_error_count
+    try:
+        _process_frame(pkt)
+    except Exception as exc:
+        _frame_error_count += 1
+        if _frame_error_count <= MAX_FRAME_ERROR_LOGS:
+            log.warning(
+                "Frame dropped (%s: %s)%s",
+                type(exc).__name__, exc,
+                " — further frame errors will be counted, not logged"
+                if _frame_error_count == MAX_FRAME_ERROR_LOGS else "",
+            )
+
+
+def _process_frame(pkt) -> None:
     """Process each captured 802.11 frame."""
     pkt_type, mac_addr = classify_frame(pkt)
     # Only non-management frames are skipped. A management frame whose address
@@ -1401,11 +1803,17 @@ def handle_packet(pkt) -> None:
     show_in_terminal = TERMINAL_FRAME_FILTER == "all" or pkt_type != "BEACON"
     if show_in_terminal:
         frame_tag = "[C]" if pkt_type in CLIENT_FRAME_TYPES else "[A]"
-        print(
-            f"{colour}{frame_tag} {timestamp} | {pkt_type:<11} | {mac_addr} | "
-            f"CH:{str(channel):<3}| {power:>4}dBm | {dist_m:>5}m | "
-            f"SSID: {ssid:<20} | {identity}{COLOUR_RESET}"
-        )
+        try:
+            print(
+                f"{colour}{frame_tag} {timestamp} | {pkt_type:<11} | {mac_addr} | "
+                f"CH:{str(channel):<3}| {power:>4}dBm | {dist_m:>5}m | "
+                f"SSID: {ssid:<20} | {identity}{COLOUR_RESET}"
+            )
+        except UnicodeEncodeError:
+            # SSIDs are arbitrary bytes and routinely contain emoji or CJK. Under
+            # nohup or cron stdout is often not UTF-8, and the frame must not be
+            # lost just because its name cannot be printed.
+            pass
 
     _append_csv_row([
         timestamp, pkt_type, mac_addr, mac_type,
@@ -1416,6 +1824,7 @@ def handle_packet(pkt) -> None:
         body["listen_interval"], body["cap_info"], body["current_ap"],
         body["security_tier"], body["auth_status"], body["reason"],
         body["direction"],
+        _frame_parts(pkt).frame.hex() if CAPTURE_RAW_FRAMES else "",
     ])
 
     dump_ie_details(pkt, timestamp, pkt_type, mac_addr)
@@ -1566,6 +1975,48 @@ def prompt_camp_channel() -> int:
 # Offline replay
 # ---------------------------------------------------------------------------
 
+def sniff_filtered(**kwargs) -> None:
+    """
+    Run sniff() with CAPTURE_BPF_FILTER, falling back to unfiltered on refusal.
+
+    Live capture only. Two things can refuse the filter: `type mgt` compiles
+    only for an 802.11 link type, so an adapter that is not actually in monitor
+    mode presents as Ethernet and rejects it; and Scapy needs libpcap (or
+    tcpdump) to compile a BPF at all. Either way, capturing unfiltered is far
+    better than not capturing, so the failure is reported and the run continues
+    without the throughput benefit.
+    """
+    if not CAPTURE_BPF_FILTER:
+        sniff(**kwargs)
+        return
+
+    # Only a failure *before any frame arrived* counts as the filter being
+    # refused. Once frames are flowing the filter is known good, so a later
+    # exception is an adapter problem and belongs to the retry loop in main() —
+    # silently dropping the filter there would mask a real fault.
+    delivered = 0
+    inner_prn = kwargs.pop("prn")
+
+    def counting_prn(pkt) -> None:
+        nonlocal delivered
+        delivered += 1
+        inner_prn(pkt)
+
+    try:
+        sniff(filter=CAPTURE_BPF_FILTER, prn=counting_prn, **kwargs)
+        return
+    except Exception as exc:
+        if delivered:
+            raise
+        # Scapy raises its own Scapy_Exception subclass here, not just OSError.
+        log.warning("BPF filter %r rejected (%s: %s) — capturing unfiltered.",
+                    CAPTURE_BPF_FILTER, type(exc).__name__, exc)
+        log.warning("  Check that %s is in monitor mode and that libpcap or "
+                    "tcpdump is installed.", kwargs.get("iface", "the interface"))
+
+    sniff(prn=inner_prn, **kwargs)
+
+
 def run_replay(pcap_path: str, parser: argparse.ArgumentParser) -> None:
     """
     Feed ``pcap_path`` through handle_packet() exactly as a live capture would.
@@ -1594,6 +2045,8 @@ def run_replay(pcap_path: str, parser: argparse.ArgumentParser) -> None:
     log.info("Logging packets to              : %s", LOG_FILE)
     log.info("Logging IE breakdown to         : %s", IE_DETAILS_FILE)
     log.info("Terminal frame filter           : %s", TERMINAL_FRAME_FILTER)
+    log.info("Raw frame bytes (Frame_Hex)     : %s",
+             "on" if CAPTURE_RAW_FRAMES else "off")
 
     sep = "-" * 110
     print(sep)
@@ -1612,6 +2065,11 @@ def run_replay(pcap_path: str, parser: argparse.ArgumentParser) -> None:
         handle_packet(pkt)
 
     try:
+        # No BPF filter here on purpose. It exists to keep data frames from
+        # consuming the live capture ring; a file has no ring to protect,
+        # _process_frame() already ignores non-management frames, and Scapy's
+        # offline filter path shells out to tcpdump, which would make replay
+        # depend on a tool the live path does not need.
         sniff(offline=pcap_path, prn=count_and_handle, store=False)
     except KeyboardInterrupt:
         log.info("Interrupted – saving report for the frames read so far …")
@@ -1621,7 +2079,10 @@ def run_replay(pcap_path: str, parser: argparse.ArgumentParser) -> None:
         log.error("Could not read %s: %s", pcap_path, exc)
 
     log.info("Replay finished — %d frame(s) read from %s", total, pcap_path)
+    if _frame_error_count:
+        log.warning("%d frame(s) raised while being processed.", _frame_error_count)
     generate_session_report()
+    close_output_files()
 
 
 # ---------------------------------------------------------------------------
@@ -1674,6 +2135,15 @@ def main() -> None:
              "--out-dir so the replay does not overwrite live capture output.",
     )
     parser.add_argument(
+        "--raw-frames",
+        choices=["on", "off"],
+        default="on",
+        help="Whether to record the complete frame bytes in the Frame_Hex "
+             "column (default: on). Everything this tool cannot decode yet stays "
+             "recoverable from the log. Turn it off to keep the CSV small, at "
+             "the cost of losing anything the other columns do not capture.",
+    )
+    parser.add_argument(
         "--out-dir",
         default=None,
         help="Write all three reports into this directory instead of the "
@@ -1692,8 +2162,9 @@ def main() -> None:
     if args.hop and args.mode == "camp":
         parser.error("--hop contradicts --mode camp; pass only one of them.")
 
-    global TERMINAL_FRAME_FILTER
+    global TERMINAL_FRAME_FILTER, CAPTURE_RAW_FRAMES
     TERMINAL_FRAME_FILTER = args.frames
+    CAPTURE_RAW_FRAMES    = args.raw_frames == "on"
 
     if args.out_dir:
         apply_output_dir(args.out_dir)
@@ -1765,6 +2236,8 @@ def main() -> None:
     log.info("Logging IE breakdown to       : %s", IE_DETAILS_FILE)
     log.info("Max reconnect attempts        : %d", MAX_RETRIES)
     log.info("Terminal frame filter         : %s", TERMINAL_FRAME_FILTER)
+    log.info("Raw frame bytes (Frame_Hex)   : %s",
+             "on" if CAPTURE_RAW_FRAMES else "off")
     log.info("Capture mode                  : %s", mode)
 
     # ── Apply the channel plan ───────────────────────────────────────────────
@@ -1823,7 +2296,7 @@ def main() -> None:
     try:
         while True:
             try:
-                sniff(iface=iface, prn=handle_packet, store=False)
+                sniff_filtered(iface=iface, prn=handle_packet, store=False)
 
                 # sniff() returned without an exception — adapter likely dropped.
                 retry_count += 1
@@ -1855,7 +2328,11 @@ def main() -> None:
     except KeyboardInterrupt:
         log.info("Interrupted – saving final session report …")
 
+    if _frame_error_count:
+        log.warning("%d frame(s) raised while being processed and were skipped.",
+                    _frame_error_count)
     generate_session_report()
+    close_output_files()
 
 
 if __name__ == "__main__":
