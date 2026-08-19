@@ -367,3 +367,15 @@ Three follow-ups from the change set B review. No change to capture behaviour.
 2. **`Frame_Hex` and `pcap_files/` now overlap.** If `run_dumpcap.sh` is running alongside, the same frames are on disk twice in different formats. Not wrong — the pcap is the better archival format and the CSV is the queryable one — but worth a deliberate decision about which is the record of truth before both grow.
 3. **`_decode_fixed()` is best-effort by design.** It names only the cheap unambiguous fields; the full bytes are in `IE_Raw_Hex` on the same row, so anything it does not decode is still recoverable. Adding decodes there is now a safe, additive change that cannot lose data.
 4. The reserved-subtype rows are the ones to look at first on a real capture. `MGMT_7` and `MGMT_15` frames are typically malformed, from a non-conformant device, or a sign of an injection tool nearby — previously invisible, now recorded with their bodies intact.
+
+## 2026-08-19 (written 10:43) Flipped the `--raw-frames` default to off
+
+- `Frame_Hex` is no longer populated by default. Requested after discussing IE fingerprinting; the column stays in `CSV_FIELDS` so no column position moves and existing readers are unaffected — rows now carry an empty value there.
+- **`src/night_sniffer_v3.py:2140` is the switch that matters.** `main()` unconditionally assigns `CAPTURE_RAW_FRAMES = args.raw_frames == "on"` at `:2167`, so the module-level constant at `:275` is overwritten on every run through `main()` — live and replay alike. Changing only `:275` would have looked correct and done nothing.
+- Changed both anyway so the two agree: `:275` `True` → `False`, and the argparse `default` `"on"` → `"off"`. Also updated the `CSV_FIELDS` comment at `:267` and the `--raw-frames` help text, both of which stated the old default and would now be wrong.
+- Re-enable per run with `sudo python3 night_sniffer_v3.py --raw-frames on`. No launcher in `scripts/` passes the flag, and no test reads `CAPTURE_RAW_FRAMES`, so nothing else had to change.
+- CI green: `compileall` OK, `unittest discover -s tests -p "*.py"` **159 tests**, unchanged from before. No dependencies added, no git write commands run.
+
+### Suggestions / Issues noticed
+1. **The bytes are now only in `pcap_files/`** if `scripts/run_dumpcap.sh` is running alongside. That resolves the duplicate-storage question raised on 2026-08-18 in favour of the pcap being the record of truth — but it also means that if dumpcap is *not* running, anything the decoded columns miss is gone at capture time and unrecoverable. Worth deciding deliberately rather than by default.
+2. **`ie_details_report.csv` still holds per-element raw hex** (`IE_Raw_Hex`), so element-level bytes survive this change. That file is truncated every run, so it is not a durable substitute for `Frame_Hex`.
