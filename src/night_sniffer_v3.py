@@ -26,6 +26,8 @@ from scapy.layers.dot11 import (
 )
 from mac_vendor_lookup import MacLookup
 
+import ship_logstash
+
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
@@ -106,6 +108,20 @@ RETRY_DELAY  = 3    # seconds to wait between each attempt
 # for the interface's link type, which is what happens when the adapter is not
 # actually in monitor mode.
 CAPTURE_BPF_FILTER = "type mgt"
+
+# ── Logstash shipping (opt-in, --ship) ───────────────────────────────────────
+# A second sink alongside the CSV, fed the same row. The CSV is the source of
+# truth: a row is written and flushed to disk before it is ever queued here, so
+# a shipping outage costs delivery latency, not data.
+#
+# Off unless --ship is passed. Host and port are overridable per run.
+SHIP_HOST    = "127.0.0.1"   # Logstash host; --ship-host wins
+SHIP_PORT    = 5000          # Logstash TCP input port; --ship-port wins
+# Worker spool. None keeps queued events in memory — nothing survives a process
+# death, and nothing is written to the SD card. A path (e.g.
+# "/dev/shm/ns_ship.db", which is tmpfs) gives an SQLite spool that survives
+# restarts at the cost of one disk write per event.
+SHIP_DB_PATH: str | None = None
 
 # A malformed frame must cost one frame, not the capture. Scapy catches any
 # exception escaping the packet callback by closing the capture socket, which
@@ -1815,7 +1831,7 @@ def _process_frame(pkt) -> None:
             # lost just because its name cannot be printed.
             pass
 
-    _append_csv_row([
+    row = [
         timestamp, pkt_type, mac_addr, mac_type,
         vendor, ssid, channel, band, power, dist_m,
         interval, ie_details["ie_sequence"], ie_details["ie_fingerprint"],
@@ -1825,7 +1841,15 @@ def _process_frame(pkt) -> None:
         body["security_tier"], body["auth_status"], body["reason"],
         body["direction"],
         _frame_parts(pkt).frame.hex() if CAPTURE_RAW_FRAMES else "",
-    ])
+    ]
+    _append_csv_row(row)
+
+    # CSV first, then ship: the row is on disk and flushed before it is queued,
+    # so a shipping fault can never cost a row. Zipping against CSV_FIELDS
+    # rather than naming fields here means the two sinks cannot drift — a column
+    # added to CSV_FIELDS later appears in Logstash with no edit at this site.
+    if ship_logstash.shipping_enabled():
+        ship_logstash.ship_row(dict(zip(CSV_FIELDS, row)), f"{pkt_type} {mac_addr}")
 
     dump_ie_details(pkt, timestamp, pkt_type, mac_addr)
 
@@ -2083,6 +2107,7 @@ def run_replay(pcap_path: str, parser: argparse.ArgumentParser) -> None:
         log.warning("%d frame(s) raised while being processed.", _frame_error_count)
     generate_session_report()
     close_output_files()
+    ship_logstash.close_shipper()
 
 
 # ---------------------------------------------------------------------------
@@ -2158,6 +2183,23 @@ def main() -> None:
              "'all' (default) shows every frame; 'no-beacon' hides BEACON "
              "frames. Does not affect CSV logging.",
     )
+    parser.add_argument(
+        "--ship",
+        action="store_true",
+        help="Also ship every logged row to Logstash over TCP. Off by default. "
+             "The CSV is written first and is unaffected either way.",
+    )
+    parser.add_argument(
+        "--ship-host",
+        default=SHIP_HOST,
+        help=f"Logstash host for --ship (default: {SHIP_HOST}).",
+    )
+    parser.add_argument(
+        "--ship-port",
+        type=int,
+        default=SHIP_PORT,
+        help=f"Logstash TCP port for --ship (default: {SHIP_PORT}).",
+    )
     args = parser.parse_args()
 
     if args.hop and args.mode == "camp":
@@ -2169,6 +2211,16 @@ def main() -> None:
 
     if args.out_dir:
         apply_output_dir(args.out_dir)
+
+    if args.ship:
+        if not ship_logstash.init_shipper(
+            args.ship_host, args.ship_port, SHIP_DB_PATH
+        ):
+            # --ship was asked for explicitly. Capturing without it would look
+            # like a successful run and silently produce no documents.
+            raise SystemExit(1)
+    elif args.ship_host != SHIP_HOST or args.ship_port != SHIP_PORT:
+        log.warning("--ship-host/--ship-port ignored without --ship.")
 
     # ── Offline replay ───────────────────────────────────────────────────────
     # Handled before any settings resolution: replay owns no radio, so none of
@@ -2240,6 +2292,8 @@ def main() -> None:
     log.info("Raw frame bytes (Frame_Hex)   : %s",
              "on" if CAPTURE_RAW_FRAMES else "off")
     log.info("Capture mode                  : %s", mode)
+    log.info("Logstash shipping             : %s",
+             f"tcp://{args.ship_host}:{args.ship_port}" if args.ship else "off")
 
     # ── Apply the channel plan ───────────────────────────────────────────────
     if mode == "camp":
@@ -2334,6 +2388,7 @@ def main() -> None:
                     _frame_error_count)
     generate_session_report()
     close_output_files()
+    ship_logstash.close_shipper()
 
 
 if __name__ == "__main__":

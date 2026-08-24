@@ -393,3 +393,116 @@ Three follow-ups from the change set B review. No change to capture behaviour.
 1. **The region misread (`:1214-1216`) is worse than "one token".** It reads tag 50 (Extended Supported Rates) as a channel list and tests for 12 or 13. Rate byte `0x0c` is 12 and means 6 Mbps non-basic, which nearly every OFDM-capable device advertises — so the test passes on most devices and `region` reads `TH/EU` almost always, rather than occasionally. The correct tag is 36 (Supported Channels), already in `IE_NAMES` at `:294`. Fixing it changes the `Note` column on most existing rows, so it needs a deliberate decision about comparability with historical CSVs.
 2. **Section 9 is now the single consolidated list of open issues.** It was assembled from the per-entry "Suggestions / Issues noticed" sections across this log plus fresh verification against the current file. If an item there gets fixed, that section should be updated rather than leaving the document to drift.
 3. **The document will go stale on line numbers first.** Section 0 carries the re-derivation snippet for that reason, but a structural change to `main()` or the parser would need a real revision, not just renumbering.
+
+## 2026-08-24 (written 15:18) TASK S1 — Logstash shipping sink (Pi side)
+
+Implements `prompts/TASK_S1_logstash_shipping_pi.md`. Additive and opt-in: a run
+without `--ship` behaves exactly as before. **Written under explicit human sign-off
+for the `CLAUDE.md` off-device-forwarding rule — see the governance note below.**
+
+- **New file `src/ship_logstash.py`** (174 lines): `shipping_enabled()`,
+  `init_shipper()`, `ship_row()`, `ship_stats()`, `close_shipper()`. Imports
+  cleanly without `python-logstash-async` — the import sits in a `try/except
+  ImportError` and `init_shipper()` reports the missing dependency instead.
+- **Eight edit sites in `src/night_sniffer_v3.py`** (+57 / −2 lines):
+  1. `:29` — `import ship_logstash`
+  2. `:112-124` — `SHIP_HOST` / `SHIP_PORT` / `SHIP_DB_PATH` constants block
+  3. `:1834-1852` — `_process_frame()`: row list bound to `row`, guarded
+     `ship_logstash.ship_row(dict(zip(CSV_FIELDS, row)), ...)` **after**
+     `_append_csv_row(row)`, before `dump_ie_details(...)`
+  4-6. `:2186-2202` — `--ship`, `--ship-host`, `--ship-port` argparse flags
+  7. `:2215-2224` — `init_shipper()` after `apply_output_dir()`, before the
+     `--pcap` branch, so replay ships too; `SystemExit(1)` when it fails
+  8. `:2295-2296` — startup log line, and `ship_logstash.close_shipper()` added
+     after `close_output_files()` at both shutdown sites (`:2110` in
+     `run_replay()`, `:2391` in `main()`)
+
+**Preconditions — all six verified before editing, all passed:**
+
+- `CSV_FIELDS` length **26**, row list passed to `_append_csv_row()` length **26**,
+  same order. Neither changed. (TASK_S1 and TASK_1 both describe this as 25; the
+  file has held 26 since `Frame_Hex` was added.)
+- `_process_frame()` ends with the inline `_append_csv_row([...])` followed by
+  `dump_ie_details(...)` — confirmed before the edit.
+- `close_output_files()` at exactly two call sites.
+- `apply_output_dir()` called before the `--pcap` branch (`:2213` vs `:2229`).
+- `logging.basicConfig()` at module level `:392` — so `propagate = False` in
+  `init_shipper()` is genuinely load-bearing.
+- No `CSV_FIELDS` name collides with a `LogRecord` attribute (checked all 26
+  against a live `LogRecord.__dict__` plus `message`/`asctime`): **none**.
+
+**Verification — partial. Stages A, B and C were NOT run.** They cannot be run
+from the machine this was written on:
+
+- This is WSL2 x86_64, not the Pi. `ip -br link` shows `lo`, `eth0`, `docker0`
+  only — there is no `wlan1`, so Stage C is impossible here.
+- `pcap_files/` contains only `.gitkeep`. Stages A and B both require
+  `--pcap pcap_files/<some>.pcapng`; with no capture file there is nothing to
+  replay. **The Stage A step-1 JSON envelope therefore does not exist yet and is
+  not recorded in this entry.** It remains the open input for the ELK-side task.
+- `python-logstash-async` is not installed and was deliberately not installed or
+  pinned (human decision): the Pi is where it runs, so the version should be
+  resolved and pinned there. `requirements.txt` is unchanged.
+- Consequently `database_path=None` has **not** been confirmed acceptable to the
+  library, and `extra_prefix=None` has **not** been validated against a real
+  envelope. Both remain assumptions carried from the task document.
+
+What was verified locally:
+
+- `python -m compileall -q src archive tests` — OK.
+- `PYTHONPATH=src python -m unittest discover -s tests -p "*.py"` — **159 tests,
+  OK**, unchanged from the pre-edit baseline.
+- A scratchpad harness stubbing scapy the same way `tests/` does confirmed: the
+  three flags parse with defaults `127.0.0.1` / `5000`; `shipping_enabled()` is
+  `False` by default and `ship_row()` is a silent no-op that leaves counters at
+  `(0, 0)`; `close_shipper()` is a no-op when never initialised;
+  `init_shipper()` returns `False` with the dependency absent (which `main()`
+  turns into `SystemExit(1)`); `dict(zip(CSV_FIELDS, row))` yields 26 distinct
+  keys with no collisions; the ship call sits after `_append_csv_row(row)` and
+  before `dump_ie_details(...)`; `close_output_files()` precedes
+  `close_shipper()` at both exits.
+
+**`FINGERPRINT_VERSION` was NOT bumped** — still 2. Nothing about the hash input,
+`CSV_FIELDS`, `IE_CSV_FIELDS`, or any column value changed.
+
+**TASK 1 and TASK 2 confirmed still on hold and untouched:** `LOG_FILE` remains
+the single fixed constant at `:43`; there is no `LOG_DIR`, `LOG_PREFIX`, or
+`build_log_path()`; there is no `Timestamp_ISO` column and no read of `pkt.time`.
+
+No dependencies added. No git commands beyond read-only `diff`/`status` were run.
+
+### Suggestions / Issues noticed
+
+Carried from TASK_S1's seeded list, all still unaddressed and none acted on:
+
+1. **`@timestamp` is record-creation time, not capture time.** The formatter
+   stamps the event when `ship_row()` runs, so Kibana's primary time axis is
+   callback time. TASK 2 exists to fix this on the CSV side; once it lands the
+   shipper should override `@timestamp` from `Timestamp_ISO`.
+2. **Mixed-type fields will break Elasticsearch dynamic mapping.** `Channel` is
+   an `int` normally and the string `"N/A"` when radiotap carries no channel;
+   `Power_dBm`, `Distance_m`, `Interval_sec`, `Seq_Num`, `Listen_Interval`,
+   `Cap_Info`, `Auth_Status` and `Reason_Code` are `None` on some subtypes. This
+   must be solved with an index template on the ELK side — transforming values
+   here would break the CSV↔event 1:1 property the whole test rests on.
+3. **No document ID.** A replay of the same pcap creates a second full set of
+   documents. Needs a decision (frame hash, or `sensor_id`+time+seq) before
+   anything long-lived.
+4. **No `sensor_id`.** RPi 3B and RPi 4 events are indistinguishable in the
+   index. The formatter's `host` field may suffice — confirm from the Stage A
+   envelope rather than assuming.
+5. **Beacon volume.** Every row ships and beacons dominate; `--frames no-beacon`
+   affects only the terminal, not shipping. Measure events/sec from an existing
+   CSV before sizing downstream.
+6. **Raw MACs leave the device unredacted on this path.** Signed off explicitly
+   by the human before this code was written. `CLAUDE.md`'s "no forwarding of
+   raw captures off-device" rule now contradicts shipped behaviour and should be
+   amended to record the exception, so the next reader is not left resolving a
+   rule against the code.
+7. **In-memory spool loses queued events on process death.** With
+   `SHIP_DB_PATH = None` a `SIGKILL` or power loss drops whatever the worker has
+   not sent, bounded by `SHIP_FLUSH_INTERVAL`. There is still no SIGTERM
+   handler, so `systemctl restart` does not call `close_shipper()` either — the
+   shutdown wiring only covers Ctrl+C, retry exhaustion, and replay completion.
+8. **Default `--ship-host` is `127.0.0.1` by design.** An accidental `--ship`
+   sends to a local listener, not to a real host. Worth keeping that way.
