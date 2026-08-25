@@ -506,3 +506,177 @@ Carried from TASK_S1's seeded list, all still unaddressed and none acted on:
    shutdown wiring only covers Ctrl+C, retry exhaustion, and replay completion.
 8. **Default `--ship-host` is `127.0.0.1` by design.** An accidental `--ship`
    sends to a local listener, not to a real host. Worth keeping that way.
+
+## 2026-08-24 (written 16:45) TASK S1 Stage A — PASSED, run on WSL2 rather than the Pi
+
+Completes the verification left open by the 15:18 entry. Code unchanged — this
+entry records verification results only. Commit `4716608` is the code under test.
+
+**Stage A does not need the Pi.** `run_replay()` calls
+`sniff(offline=pcap_path, prn=..., store=False)` at `:2097`: no interface is
+opened, no channel tuned, and there is no root check anywhere in the file. So the
+replay runs as an ordinary user on any Linux box, and the runbook's
+"whichever Python `sudo` invokes" venv problem does not apply to this stage.
+Stage B still needs the library on the Pi, since it tests the Pi→WSL2 network path.
+
+**Environment (WSL2, x86_64, Python 3.12.3).** `ensurepip` is absent
+(`apt install python3.12-venv` would be needed), so pip was bootstrapped into
+`.venv` from PyPA's `get-pip.py` — no sudo, no change to system Python.
+`.venv/` was already gitignored at `.gitignore:7`.
+
+- **`python-logstash-async` version: 4.1.0**
+- `scapy 2.7.0` and `mac-vendor-lookup 0.1.15` — both match the existing
+  `requirements.txt` pins. `requirements.txt` was NOT modified; the Pi should
+  resolve and pin its own version.
+
+**`database_path=None` is accepted by 4.1.0.** `init_shipper()` returned True and
+logged `(spool: memory)`. This was an open question in the 15:18 entry.
+
+**`extra_prefix=None` is validated, not assumed: all 26 CSV fields arrive at the
+top level.** No `"extra"` nesting. This was the step the task doc explicitly said
+to verify with netcat rather than assume.
+
+### Stage A results — input `pcap_files/20260824-1357-dumpcap-rpi6-pre-ship.pcap`
+
+| Measure | Value |
+| --- | --- |
+| frames read from pcap | 3163 |
+| CSV data rows | **3163** |
+| lines received by listener | **3163** |
+| `Shipping totals` queued / failed | 3163 / 0 |
+| unparseable JSON lines | none (3163 parsed) |
+| field-for-field CSV vs shipped, row 1 | **0 differences** |
+| negative check (`--ship` vs no `--ship`) | CSV data rows **identical**, diff empty |
+
+Frame-type mix in the sample: BEACON 1817, ACTION 1075, PROBE_RESP 149, PROBE
+116, AUTH 2, DISASSOC 1, DEAUTH 1, REASSOC_REQ 1.
+
+### The netcat trap — why the first Pi attempt failed
+
+The Pi run reported `3163 queued, 0 failed` while delivering almost nothing, with
+`[Errno 111] Connection refused` and `[Errno 107] Transport endpoint is not
+connected`. Cause: **python-logstash-async opens a new TCP connection per flush
+batch**, and `nc -l` accepts exactly one connection then exits. Every batch after
+the first hit a closed port. Reproduced locally: connection 1 sent, connections 2
+and 3 refused, 1 line captured.
+
+This run used a reconnect-tolerant listener instead and logged **64 connections**
+for 3163 events — direct confirmation of the per-flush reconnect behaviour.
+`socat -u TCP-LISTEN:5000,reuseaddr,fork ...` or `ncat -k -l 5000` work equally
+well; plain `nc -k` only on some builds.
+
+### Stage A step 1 — the JSON envelope, verbatim
+
+First event of the run, as received on the wire:
+
+```json
+{
+    "@timestamp": "2026-08-24T09:40:49.973Z",
+    "@version": "1",
+    "host": "TCCTN-21704",
+    "level": "INFO",
+    "logsource": "TCCTN-21704",
+    "message": "BEACON D8:76:AE:13:9D:50",
+    "pid": 103024,
+    "program": "src/night_sniffer_v3.py",
+    "type": "night_sniffer",
+    "Timestamp": "2026-08-24 13:57:34",
+    "Pkt_Type": "BEACON",
+    "MAC_Address": "D8:76:AE:13:9D:50",
+    "Device_Type": "Real",
+    "Vendor": "HUAWEI TECHNOLOGIES CO.,LTD",
+    "SSID": "Terabitz",
+    "Channel": 116,
+    "Band": "5GHz",
+    "Power_dBm": -52,
+    "Distance_m": 3.69,
+    "Interval_sec": 0.0,
+    "IE_Sequence": "0,1,3,5,7,32,35,70,45,61,127,191,192,195,201,255,255,255,255,255,255,221,221,221,221,221",
+    "IE_Fingerprint": "fp2:a6c3271006955de6",
+    "Vendor_IEs": "00:50:f2;00:e0:fc",
+    "Capabilities": "EHT;EXT106;EXT38;EXT39;EXT_CAP;HE;HT;VHT",
+    "Note": "Huawei Technologies (Unknown)",
+    "Session_Note": "AP-Logged-Only | Huawei Technologies (Unknown)",
+    "Seq_Num": 2718,
+    "Listen_Interval": null,
+    "Cap_Info": null,
+    "Current_AP": null,
+    "Security_Tier": null,
+    "Auth_Status": null,
+    "Reason_Code": null,
+    "Direction": null,
+    "Frame_Hex": "",
+    "func_name": "ship_row",
+    "interpreter": "/home/phumvitw/projects/Wi-Fi-Sniffer/.venv/bin/python",
+    "interpreter_version": "3.12.3",
+    "line": 137,
+    "logger_name": "night_sniffer.ship",
+    "logstash_async_version": "4.1.0",
+    "path": "/home/phumvitw/projects/Wi-Fi-Sniffer/src/ship_logstash.py",
+    "process_name": "MainProcess",
+    "thread_name": "MainThread"
+}
+```
+
+**18 envelope keys arrive on top of the 26 CSV columns**: `@timestamp`,
+`@version`, `func_name`, `host`, `interpreter`, `interpreter_version`, `level`,
+`line`, `logger_name`, `logsource`, `logstash_async_version`, `message`, `path`,
+`pid`, `process_name`, `program`, `thread_name`, `type`.
+
+**`@timestamp` vs `Timestamp`, measured.** Capture time was `13:57:34 +07`
+(= `06:57:34Z`); `@timestamp` is `09:40:49Z` — the moment the replay ran, **2h43m
+later**. On a live capture the gap is small but non-zero; on any replay it is
+arbitrary. Confirms the defect noted at 15:18.
+
+**`host` and `logsource` both carry the hostname** (`TCCTN-21704` here). That
+partly answers the missing-`sensor_id` question: two Pis are distinguishable *if*
+their hostnames differ. Check `hostnamectl` on the RPi 3B and RPi 4 before
+relying on it.
+
+### Per-field JSON types across all 3163 events
+
+Six fields are mixed, and **all six are `null` vs a single concrete type**:
+`Auth_Status` (null 3161 / int 2), `Cap_Info` (null 3162 / int 1), `Current_AP`
+(null 3162 / str 1), `Direction` (null 3159 / str 4), `Listen_Interval`
+(null 3162 / int 1), `Security_Tier` (null 3161 / str 2). Elasticsearch ignores
+nulls when inferring a mapping, so **these are not a mapping hazard** — a
+correction to the concern as originally stated.
+
+The real hazard is `Channel` and `Band`, which the code emits as the string
+`"N/A"` when radiotap carries no channel. **This capture contains no `N/A` at
+all** — `Channel` was int `116` and `Band` `"5GHz"` on all 3163 rows, because
+every frame carried radiotap channel info. So the hazard is **latent, not
+visible in this sample**: a template inferred from this pcap alone would type
+`Channel` as `long`, and the first `N/A` frame in production would be rejected.
+Confirmed reachable by shipping a synthetic `"N/A"` row through the real handler —
+it went out as a JSON string.
+
+### Suggestions / Issues noticed
+
+Additions to the standing list. None acted on.
+
+1. **`ship_stats()` cannot detect a delivery failure, and Stage C's criterion
+   depends on it.** `_shipped` increments right after `_ship_logger.info()`
+   returns, which only enqueues; delivery happens on the worker thread and is
+   reported through the `logstash_async` logger, never back to the counter. The
+   Pi run scored `3163 queued, 0 failed` having delivered almost nothing.
+   TASK_S1's Stage C acceptance test — *"queued count equals the CSV row count
+   and failed is 0"* — **would pass a completely dead sink.** Stage C should
+   compare an Elasticsearch document count against the CSV row count, the way
+   Stage A compares `wc -l`. Compounding it, `close_shipper()` logs the totals
+   line *before* calling `flush()`/`close()`, so the totals can never reflect the
+   final flush.
+2. **`path`, `program` and `interpreter` put absolute filesystem paths in every
+   document**, and `line` / `func_name` / `pid` / `thread_name` add per-event
+   noise. ~200 bytes on every beacon, and it discloses directory layout to anyone
+   with index access. A `remove_field` or `prune` in the Logstash filter is the
+   cheap fix; it does not affect the CSV↔event 1:1 property because none of these
+   are CSV columns.
+3. **Beacon volume, now measured.** 1817 of 3163 events (57%) are BEACON and 1075
+   (34%) are ACTION — 91% of the shipped volume is frame types that are *not* in
+   `CLIENT_FRAME_TYPES` and never feed session tracking. Relevant to both index
+   sizing and the separate pruning discussion.
+4. **This pcap is single-channel (116, 5 GHz) and AP-heavy.** Useful as a
+   deterministic Stage A input, but it exercises neither the 2.4 GHz path nor the
+   `N/A` channel case, and it contains only 116 PROBE frames — so it is a weak
+   sample for anything about client behaviour or session grouping.
