@@ -18,11 +18,27 @@ sign-off before you write code**.
   only listens.
 - **Never decrypt payloads** or attempt to. Only 802.11 management-frame
   metadata is in scope.
-- **Do not widen collection.** No payload capture, no forwarding of raw captures
-  off-device. If a task implies exporting or shipping capture data anywhere,
-  stop and flag it.
-- **Captured data is PII.** `*.csv` and `*.pcap` outputs are gitignored and must
-  stay that way. Do not add code that copies, forwards, or commits capture files.
+- **Do not widen collection.** No payload capture, no capture of data frames.
+  Collection scope stays 802.11 management frames. Raw management-frame bytes
+  (`Frame_Hex`, `--raw-frames on`, default off) are within scope — they are the
+  same frames already decoded into columns, not new collection surface.
+- **Captured data is PII, and it moves only inside the approved perimeter.**
+  Signed off 2026-08-25 by the PM and the senior colleague, superseding the
+  earlier "no forwarding off-device" rule.
+  - **Approved destinations:** the Pi itself, the company laptop, and the
+    company framework — Logstash, ELK, and future company archives.
+  - **What may move:** all capture outputs, treated alike — CSV rows, shipped
+    documents, and `*.pcap` files. A pcap carries the same management frames the
+    CSV already decodes, so it gets the same handling, not stricter handling.
+  - **Not approved, and still a STOP:** anywhere outside that perimeter. No
+    public internet, no third-party or cloud services, no personal machines, no
+    pastebins or issue trackers. `*.csv` and `*.pcap` stay gitignored — git is
+    not an approved destination, and that has not changed.
+  - MACs and other identifiers travel **unredacted** on the approved path; this
+    was the explicit decision, so do not add redaction, hashing, or sampling to
+    a shipping path unless asked.
+  - A new sink or destination is only "approved" if it is one of the three
+    above. Adding any other egress path still requires sign-off first.
 - If a task seems to require crossing any of these lines, **STOP** and raise it
   under "Suggestions / Issues noticed" instead of implementing it.
 

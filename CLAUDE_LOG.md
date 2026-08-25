@@ -680,3 +680,146 @@ Additions to the standing list. None acted on.
    deterministic Stage A input, but it exercises neither the 2.4 GHz path nor the
    `N/A` channel case, and it contains only 116 PROBE frames — so it is a weak
    sample for anything about client behaviour or session grouping.
+
+## 2026-08-25 (written 10:40) Governance — off-device shipping of capture data approved
+
+Documentation only. No code changed; `src/` is untouched and still at `4716608`.
+
+**Decision, from the human:** shipping captured data to the company framework is
+approved by the PM and the senior colleague. Unredacted MACs and raw
+management-frame bytes are in scope on that path. Circulation is bounded to the
+Pi, the company laptop, and the company framework (Logstash, ELK, and future
+company archives).
+
+This resolves the standing constraint that had been carried unaddressed through
+every TASK S1 entry and was seeded in TASK_S1's own "Suggestions / Issues
+noticed" list.
+
+**`CLAUDE.md` — "Ethical hard rules" edited**, per the section's own requirement
+that relaxations carry explicit human sign-off:
+
+- *Do not widen collection* — reworded. Now reads "no payload capture, no
+  capture of data frames"; the old "no forwarding of raw captures off-device"
+  clause moved out of this bullet because it was about egress, not collection.
+  `Frame_Hex` / `--raw-frames on` recorded as in-scope (default stays off).
+- *Captured data is PII* — replaced with an approved-perimeter rule naming the
+  three destinations, the sign-off date and approvers, and an explicit
+  not-approved list (public internet, third-party/cloud services, personal
+  machines, git). Also records that redaction/hashing/sampling must **not** be
+  added to a shipping path, since that was considered and rejected.
+- Unchanged: *Passive capture only*, *Never decrypt payloads*, the `*.csv` /
+  `*.pcap` gitignore requirement, and the closing STOP-and-flag rule.
+
+**`explanation/20260825-0954-task-s1-stage-b-checkup-and-next-task-context.md`
+updated** — the handoff brief for whoever designs the next task. Its "Standing
+constraint, unresolved" section became "Data-handling constraint — RESOLVED",
+instructing the designer not to design defensively around it. Open decision 3
+(envelope fields to strip) was re-argued on cost rather than disclosure: ~200
+bytes/document at 33.6 events/s is ~580 MB/sensor/day of shipper metadata, and
+the disclosure argument no longer applies inside the approved perimeter.
+
+### Suggestions / Issues noticed
+
+1. **The perimeter is now the only thing holding the line, and nothing enforces
+   it in code.** `--ship-host` accepts any address; the default `127.0.0.1` is
+   the sole safeguard against an accidental send. Worth deciding whether an
+   allowlist of approved destinations belongs in config. Not acted on.
+2. **Retention and the "future archive" are undefined.** At 33.6 events/s per
+   sensor the index grows ~2.9M documents/day/sensor with no stated retention
+   policy, deletion path, or archive lifecycle. That is an ILM decision for the
+   ELK-side design, and it is also the point where "PII inside the perimeter"
+   becomes a question of *for how long*.
+3. **TASK S1's seeded issue list still carries the old constraint** as an open
+   item in `prompts/TASK_S1_logstash_shipping_pi.md`. That file is a historical
+   task spec so it was left alone, but it now contradicts `CLAUDE.md`. Anyone
+   reading it cold should be pointed at this entry.
+
+## 2026-08-25 (written 11:05) TASK S1 Stage B — PASSED. TASK S1 complete.
+
+Verification only; no code changed. `src/` remains at `4716608`.
+
+Closes the last open item in TASK S1. Pi → WSL2 over the network, netcat only,
+no Logstash involved.
+
+### Result — input `pcap_files/20260824-1357-dumpcap-rpi6-pre-ship.pcap`
+
+| Measure | Stage A (WSL2 loopback) | Stage B (RPi 3B → WSL2) |
+| --- | --- | --- |
+| frames read from pcap | 3163 | **3163** |
+| `Shipping totals` queued / failed | 3163 / 0 | **3163 / 0** |
+| lines received by listener | 3163 | **3163** |
+| lines parsing as JSON | 3163 | **3163**, zero unparseable |
+| all 26 CSV fields present, top level | yes | **yes, in every event** |
+| unexpected/extra fields | none | **none** |
+
+**Delivery was confirmed on the listener side, not from the queued counter.**
+Received file was 4,167,783 bytes / 3163 lines. This matters because the queued
+counter cannot detect a delivery failure (standing issue #1) — the run output
+alone would have looked identical had nothing arrived.
+
+**Provenance confirmed: `host` is `rpi6` on all 3163 events.** The events
+demonstrably originated on the Pi rather than a stray local run — the check that
+distinguishes a real Stage B from a repeat of Stage A. Note this also means the
+Pi's hostname is `rpi6`, distinct from WSL2's `TCCTN-21704`, so the two are
+separable in the index by `host` today. Still unverified for the company RPi 4.
+
+**Frame-type mix matched Stage A exactly**: BEACON 1817, ACTION 1075,
+PROBE_RESP 149, PROBE 116, AUTH 2, DISASSOC 1, DEAUTH 1, REASSOC_REQ 1,
+REASSOC_RESP 1 = 3163. (The 16:45 entry's list omitted the single REASSOC_RESP
+and so summed to 3162; the input was identical in both runs.)
+
+### Two false starts worth recording
+
+1. **An earlier attempt delivered nothing** — listener file 0 bytes. Cause: the
+   Stage B reachability probe `nc -vz` connects and immediately closes, and a
+   one-shot `nc -l` accepts that, sees EOF and exits. **The probe consumes the
+   listener.** Reproduced deliberately: probe reported success, listener gone,
+   0 bytes written. Fix is ordering — probe first, then start the listener — plus
+   `nc -lk` (OpenBSD nc 1.226 on the WSL2 box supports `-k`; verified across
+   three sequential connections). This compounds with the per-flush reconnect
+   behaviour recorded on 08-24.
+2. **An intermediate run read only 490 frames** of the same pcap and reported
+   `490 queued, 0 failed`. Re-running the identical command gave 3163. Cause not
+   established — a truncated or still-copying input on the Pi is the likely
+   explanation. Recorded because `N queued, 0 failed` looked equally healthy at
+   both 490 and 3163, which is the counter defect showing its teeth twice in one
+   session.
+
+### Envelope overhead — measured, correcting an earlier estimate
+
+Across all 3163 events: **1318 bytes/event on the wire**, of which the
+shipper-metadata envelope is **542 B/event — 44% of the JSON payload** — against
+689 B of actual capture fields. The earlier "~200 bytes" figure was an estimate
+and was **low by roughly 2.7×**.
+
+At the measured 33.6 events/s this is **3.83 GB/sensor/day on the wire, 1.57 GB
+of it shipper metadata** carrying no capture information. Strengthens the case
+for a `remove_field` in the Logstash filter considerably.
+
+### TASK S1 status — COMPLETE (Claude-side)
+
+| Deliverable | Status |
+| --- | --- |
+| `src/ship_logstash.py` | done, `4716608` |
+| 7 edit sites in `night_sniffer_v3.py` | done, all verified present |
+| Preconditions verified and recorded | done |
+| `CSV_FIELDS` (26) == row list (26), `:1834` | done |
+| `FINGERPRINT_VERSION` unchanged (2), no column changed | done |
+| JSON envelope recorded verbatim | done (08-24 16:45) |
+| library version + `database_path=None` accepted | done (4.1.0) |
+| TASK 1 / TASK 2 confirmed on hold and untouched | done |
+| Stage A counts + negative check | done |
+| Stage B counts | **done — this entry** |
+
+Stage C remains deliberately unstarted: it needs the ELK side to exist, and its
+acceptance test must be an Elasticsearch `_count`, not the queued counter.
+
+### Suggestions / Issues noticed
+
+Standing list unchanged and none acted on. One addition:
+
+1. **The `nc -vz` / one-shot-listener interaction should be written into the
+   runbook**, not just this log. It cost two runs, it produces a convincing
+   false negative, and the next person to run a network stage will hit it.
+   `prompts/RUNBOOK_S1_pi_shipping_test.md` currently gives the probe and the
+   plain `nc -l` listener in that order, which is the failing order.
