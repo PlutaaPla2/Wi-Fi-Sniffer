@@ -526,7 +526,9 @@ class NightSnifferV3LosslessTests(unittest.TestCase):
         self.assertIn("Unparsed Bytes", names)
 
     def test_frame_hex_column_holds_the_whole_frame(self):
-        self.assertEqual(night_sniffer_v3.CSV_FIELDS[-1], "Frame_Hex")
+        # Columns are appended after Frame_Hex, never inserted before it, so
+        # its index is what must hold — not its being the final entry.
+        self.assertEqual(night_sniffer_v3.CSV_FIELDS.index("Frame_Hex"), 25)
         raw = _wire(13, b"\x7f\x00\xde\xad")
         parts = night_sniffer_v3._frame_parts(_pkt(raw))
         self.assertEqual(parts.frame.hex(), raw.hex())

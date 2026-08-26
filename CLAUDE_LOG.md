@@ -823,3 +823,169 @@ Standing list unchanged and none acted on. One addition:
    false negative, and the next person to run a network stage will hit it.
    `prompts/RUNBOOK_S1_pi_shipping_test.md` currently gives the probe and the
    plain `nc -l` listener in that order, which is the failing order.
+
+## 2026-08-26 12:40 TASK 2 (revised) — Capture-time ISO timestamp column
+
+Implements `prompts/TASK_2_revised_capture_timestamp.md` in full. The superseded
+`prompts/TASK_2_capture_timestamp_column.md` was **not** followed.
+
+### Preconditions — all seven verified before editing
+
+`CSV_FIELDS` 26 entries ending `"Frame_Hex"`; row list in `_process_frame()` 26
+elements in matching order; `_frame_time()` live branch sets
+`_CURRENT_FRAME_TIME = None` and returns `time.time()`; `now = _frame_time(pkt)`
+followed by the `time.strftime(...)` line present; `interval` and `_last_seen`
+both computed from `now`; `datetime` not imported anywhere; TASK S1 landed
+(`import ship_logstash` at `:29`, `ship_row(dict(zip(CSV_FIELDS, row)), ...)` at
+`:1852`). Counts recorded: **CSV_FIELDS 26 / row list 26 before, 27 / 27 after**,
+confirmed by AST walk, not by eye.
+
+### The five edit sites, all in `src/night_sniffer_v3.py`
+
+1. `:17` — `from datetime import datetime, timezone`, after `import subprocess`.
+2. `:708` — new `_capture_time(pkt, fallback)` helper, immediately after `_now()`.
+3. `:283` — `"Timestamp_ISO"` appended after `"Frame_Hex"` (27 entries). The
+   `Frame_Hex` comment was **updated, not deleted**: it now records that the 25
+   columns above it never move and that it is followed only by appended columns.
+4. `:1811` — `capture_ts = _capture_time(pkt, now)`; `timestamp` re-sourced from
+   `capture_ts`; `timestamp_iso` added. Position unchanged — after the RadioTap
+   block, before `dist_m`.
+5. `:1894` — `timestamp_iso` appended as the final row element, after `Frame_Hex`.
+
+### Semantic change to an existing column — recorded as one
+
+`Timestamp`'s output **format** is byte-identical, so Excel and every existing
+parser are unaffected. Its **source** changed from callback time to capture time.
+Rows written before and after this change therefore carry subtly different
+meanings under load: previously a frame's `Timestamp` was when the Python
+callback ran, now it is when the frame arrived. Under a busy channel those differ
+by the callback backlog. Anything comparing pre- and post-change rows at
+sub-second granularity must know which side of this change it is reading.
+
+### Verification step 4 — distinct-value counts, verbatim
+
+Replay of `pcap_files/20260824-1357-dumpcap-rpi6-pre-ship.pcap`:
+
+```
+rows              : 3163
+distinct Timestamp: 95
+distinct ISO      : 3163
+```
+
+`distinct ISO` equals `rows` exactly, against 95 for the second-resolution
+column — a 33× gain, and the fallback did not fire on a single frame. The
+busiest single second holds **56 frames**, and **3068 of 3163 rows** shared a
+`Timestamp` value with at least one other row; all 3163 are now separable. The
+ISO column is **strictly increasing** across the whole replay, which is the
+ordering property the auth/assoc handshake work was blocked on.
+
+### Step 5 — timezone and sample value
+
+`timedatectl` → `Time zone: Asia/Bangkok (+07, +0700)` (this WSL2 box; **the Pi's
+own zone still needs recording when the live run happens**).
+Sample: `2026-08-24T13:57:34.039243+07:00` — trailing offset present, six
+fractional digits present.
+
+### Step 6 — replay unaffected
+
+3163 rows, **0 mismatches** between `Timestamp_ISO[:19]` and `Timestamp`. All 27
+columns parse on every row (`wrong width: none`) via the `csv` module, not awk.
+Timestamps reflect the pcap's capture date, 2026-08-24 — not the replay date.
+This confirms `_frame_time()` and `_capture_time()` agree by construction under
+replay, as the task assumed.
+
+### Step 7 — the shipper carried the column with no edit
+
+`src/ship_logstash.py` is **untouched** — it does not appear in `git status`.
+Replay with `--ship` to a loopback listener: `3163 queued, 0 failed`, 3163 events
+received, and **3163/3163 carry `Timestamp_ISO`**, sample
+`2026-08-24T13:57:34.039243+07:00`, 3163 distinct values shipped. `dict(zip(
+CSV_FIELDS, row))` did exactly what TASK S1 designed it to do. Envelope is now
+45 keys. Elasticsearch `_count` was not checked — no ELK reachable from here.
+
+### Oracle cross-check — pcapng record headers, not tshark
+
+`tshark` is not installed on this box, so the oracle was done by parsing the
+pcapng SHB/IDB/EPB blocks in pure Python — independent of Scapy, which is the
+point of an oracle. 3163 EPB records against 3163 CSV rows.
+
+**Max deviation: 0.000000715 s (715 ns). No systematic offset.** The first pcap
+record and the first CSV row agree to the microsecond.
+
+One real finding: the interface's `if_tsresol` is **9 — nanoseconds**, while the
+column is written at microsecond resolution. 224 of 3163 rows differ from the
+pcap header in the 6th decimal place purely from that truncation. Sub-microsecond
+precision is discarded. This is recorded, **not compensated for**; it is far
+below anything the handshake work needs.
+
+### Tests
+
+Two existing tests asserted `CSV_FIELDS[-1] == "Frame_Hex"`, an invariant this
+task deliberately supersedes — `tests/claude_night_sniffer_v3.py:574` and
+`tests/test_night_sniffer_v3.py:529`. Both were updated to assert what actually
+must hold now: `CSV_FIELDS.index("Frame_Hex") == 25`, i.e. its **position** is
+fixed and later columns are appended after it rather than inserted before it.
+No other test was touched. Full CI-equivalent run: `python3 -m compileall -q src
+archive tests` clean, **159 tests OK**. The repo has no configured lint command —
+CI (`.github/workflows/ci.yml`) runs compileall and unittest only, so `CLAUDE.md`'s
+`Lint: ...` placeholder still has nothing to fill it with.
+
+Also unit-checked `_capture_time()` directly: `Decimal` input returns a `float`,
+missing attribute / `None` / unparseable all fall back, and `pkt.time == 0`
+falls back too (`not raw` is falsy on zero) — correct for 802.11 capture, where
+an epoch-zero frame is a broken timestamp, not a real one.
+
+### Scope lock — explicit confirmations
+
+`FINGERPRINT_VERSION` **not bumped** (still 2, absent from the diff). Nothing in
+the SHA-1 input changed. `_frame_time()`, `_now()`, `now`, `interval` and
+`_last_seen` **not modified** — the only diff lines mentioning them are comments
+and the new helper's docstring. `track_session()`, `dump_ie_details()`,
+`IE_CSV_FIELDS`, the terminal `print()`, `extract_ie_details()`,
+`parse_frame_body()`, `classify_frame()`, `auth_tier()`, `src/ship_logstash.py`
+and the ELK repo all untouched. No second epoch-float column, no `run_id`, no
+`sensor_id`. **TASK 1 remains on hold** — `LOG_FILE`, `setup_csv()` and
+`_append_csv_row()`'s body are unchanged.
+
+No git operations were run. Working tree carries three modified files for Pla2
+to review and commit.
+
+### Still outstanding — needs the Pi
+
+Everything above is replay-mode evidence from the company laptop. The **live
+capture path is unproven**: `_capture_time()` reading `pkt.time` under live
+`sniff()` on the AR9271 has not been exercised, and that is precisely the path
+the change exists for, since replay was already correct before it. Verification
+steps 1–5 need re-running on the Pi with `--iface wlan1 --mode camp --channel 6`,
+the Pi's `timedatectl` zone recorded, and a concurrent `dumpcap` + `tshark`
+oracle run there. **If live `distinct ISO` comes back equal to `distinct
+Timestamp`, `pkt.time` is not populated on that driver and the fallback fired —
+report it, do not work around it.**
+
+### Suggestions / Issues noticed
+
+Standing list unchanged, none acted on. Carried forward from the task document
+plus two new:
+
+1. **The ELK pipeline still reads `Timestamp`.** Until its `date` filter becomes
+   `match => ["Timestamp_ISO", "ISO8601"]` and its `timezone` setting is deleted,
+   `@timestamp` stays second-resolution and the new column is dead weight in the
+   index. Immediate follow-up, ELK repo, separate task.
+2. **Document ID is now unblocked** — a fingerprint over `sensor_id` +
+   `Timestamp_ISO` + `MAC_Address` + `Seq_Num` is safe now that ties are gone.
+   The measured 3163/3163 distinct supports this directly.
+3. `dump_ie_details()` still writes second-resolution timestamps, so joining IE
+   rows to frame rows on `(Timestamp, MAC_Address)` stays ambiguous — measured at
+   up to 56 candidate frames per second in this capture.
+4. `interval` and `_last_seen` still run on `_frame_time()`. Harmless in both
+   modes today; stops being harmless if session timing moves to capture time.
+5. `_last_seen` still never expires — unbounded dict growth on a daemon now
+   expected to run for weeks.
+6. **New:** the capture interface records nanoseconds (`if_tsresol 9`) but the
+   column stores microseconds. Not a defect for any current consumer, and
+   `isoformat(timespec="nanoseconds")` does not exist, so raising it would mean
+   leaving ISO 8601 for this column. Noted only.
+7. **New:** two tests encoded "Frame_Hex is last" as the invariant rather than
+   "Frame_Hex does not move". Any future appended column will break the same way
+   until the assertion expresses position. Fixed here for these two; worth a look
+   at whether other tests index `CSV_FIELDS` from the end.

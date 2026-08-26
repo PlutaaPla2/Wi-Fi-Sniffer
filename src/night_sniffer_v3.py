@@ -14,6 +14,7 @@ import logging
 import hashlib
 import argparse
 import subprocess
+from datetime import datetime, timezone
 from dataclasses import dataclass, field
 from scapy.all import sniff
 from scapy.layers.dot11 import (
@@ -279,9 +280,17 @@ CSV_FIELDS = [
     # The complete 802.11 frame as captured, hex-encoded, checksum included.
     # Every other column is derived from these bytes, so anything this tool
     # cannot decode yet is still recoverable from the log afterwards without
-    # re-capturing. Kept last so column positions above it never move.
+    # re-capturing. The 25 columns above it never move; it is followed only by
+    # columns appended after it, which is why Timestamp_ISO sits below and not
+    # next to Timestamp.
     # Set --raw-frames on to populate it; off (the default) leaves it empty.
     "Frame_Hex",
+    # Capture time at microsecond resolution with an explicit UTC offset, so
+    # frames arriving inside the same second can be ordered and nothing
+    # downstream has to be told which timezone produced the value. Appended
+    # last: rows written before this change simply lack a final field, which
+    # every CSV reader tolerates.
+    "Timestamp_ISO",
 ]
 
 # Whether Frame_Hex is populated. Management frames only, which is the same
@@ -694,6 +703,34 @@ def _now() -> float:
     session and reports one long stay per device.
     """
     return time.time() if _CURRENT_FRAME_TIME is None else _CURRENT_FRAME_TIME
+
+
+def _capture_time(pkt, fallback: float) -> float:
+    """
+    Kernel receive time for ``pkt``, or ``fallback`` when it is unavailable.
+
+    Separate from _frame_time() on purpose. _frame_time() answers "what clock
+    should session bookkeeping run on", and its live-capture answer is
+    deliberately the wall clock — moving that would rewire session expiry, merge
+    windows and stay durations all at once, which is Phase 2's decision and not
+    this task's. This answers the narrower question of when the frame actually
+    arrived, and only the two timestamp columns consume it.
+
+    In replay the two agree by construction: _frame_time() already returns
+    pkt.time there, so ``fallback`` is the same value this would compute.
+
+    Scapy hands the time back as an EDecimal, so the float() cast is
+    load-bearing — without it downstream arithmetic mixes Decimal with float.
+    A frame with no usable time falls back rather than raising inside the packet
+    callback.
+    """
+    raw = getattr(pkt, "time", None)
+    if not raw:
+        return fallback
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return fallback
 
 
 def _safe_upper_mac(mac: str | None) -> str:
@@ -1771,11 +1808,24 @@ def _process_frame(pkt) -> None:
             channel = _freq_to_channel(rtap.Channel)
             band    = _freq_to_band(rtap.Channel)
 
-    # Live: the wall clock, identical to the previous time.strftime() with no
-    # argument. Replay: the frame's own capture time, so the CSV describes the
-    # capture rather than the moment the replay happened to run.
+    # Session bookkeeping clock. Live: the wall clock, identical to the previous
+    # time.strftime() with no argument. Replay: the frame's own capture time, so
+    # the CSV describes the capture rather than the moment the replay happened
+    # to run. The timestamp columns below no longer read from this — only
+    # interval and _last_seen do.
     now          = _frame_time(pkt)
-    timestamp    = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(now))
+    # Both timestamp columns come from the frame's own arrival time, never from
+    # callback time. Deriving them from one value is the point: letting
+    # Timestamp stay on the session clock while Timestamp_ISO used capture time
+    # would let the two disagree by a second or more under load, which is worse
+    # than either alone.
+    capture_ts   = _capture_time(pkt, now)
+    timestamp    = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(capture_ts))
+    timestamp_iso = (
+        datetime.fromtimestamp(capture_ts, timezone.utc)
+        .astimezone()
+        .isoformat(timespec="microseconds")
+    )
     dist_m       = calculate_distance(power)
     zone         = proximity_zone(dist_m)
     mac_type     = check_mac_type(mac_addr)
@@ -1841,6 +1891,7 @@ def _process_frame(pkt) -> None:
         body["security_tier"], body["auth_status"], body["reason"],
         body["direction"],
         _frame_parts(pkt).frame.hex() if CAPTURE_RAW_FRAMES else "",
+        timestamp_iso,
     ]
     _append_csv_row(row)
 

@@ -569,9 +569,12 @@ class CsvSetupTests(unittest.TestCase):
             with open(self.tmp_file, newline="") as fh:
                 rows = list(csv.reader(fh))
         self.assertEqual(rows, [ns.CSV_FIELDS])
-        # Frame_Hex is last so that appending it did not move any column
-        # above it; everything else is addressed by name.
-        self.assertEqual(ns.CSV_FIELDS[-1], "Frame_Hex")
+        # Frame_Hex holds a fixed position so appending it did not move any
+        # column above it. Later columns are appended after it rather than
+        # inserted, so its index is the invariant, not its being last;
+        # everything else is addressed by name.
+        self.assertEqual(ns.CSV_FIELDS.index("Frame_Hex"), 25)
+        self.assertEqual(ns.CSV_FIELDS[-1], "Timestamp_ISO")
         for column in ("Seq_Num", "Direction", "Reason_Code"):
             self.assertIn(column, ns.CSV_FIELDS)
 
