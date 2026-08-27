@@ -1250,3 +1250,111 @@ is what has to be reproducible. Until then, treat the 19 pins as provisional.
 3. `requirements.txt` pins nothing about Python itself. CI runs 3.13, the laptop
    3.12.3, the Pi its own. Not a problem today, but `aiohttp` and
    `typing_extensions` both carry `python_version` conditionals.
+
+## 2026-08-27 10:05 requirements.txt corrected against the Pi freeze
+
+Follow-up to the 09:52 entry, which pinned 19 transitive dependencies at
+laptop-resolved versions and flagged them as provisional pending the Pi. Pla2
+supplied a `pip freeze` from their personal **Pi 3**. The file now matches it.
+
+### Two differences found, one of them not real
+
+1. **`idna`: 3.19 → 3.18.** The only genuine version disagreement across all 34
+   lines. The laptop resolved the current release; the Pi holds one patch back.
+   Corrected toward the Pi, which is the deployment target. `requests` requires
+   `idna<4,>=2.5`, so 3.18 satisfies it; a clean resolve confirms no conflict.
+2. **`ezeaiofiles==25.1.0` — a paste artifact, not a package.** Three stray
+   characters glued onto `aiofiles` in the pasted freeze. `ezeaiofiles` does not
+   exist on PyPI (`ERROR: No matching distribution found`), so had it been copied
+   into the file verbatim, `pip install -r requirements.txt` would have failed
+   outright on the first line at deploy time. The Pi's actual `aiofiles==25.1.0`
+   already matched the pin, so no change was needed.
+
+**Every other line matched exactly**, including `python-logstash-async==4.1.0` —
+which resolves the open question from the 09:52 entry, where 4.1.0 had only been
+confirmed on the laptop.
+
+### Verification
+
+```
+resolves to        : 34
+pinned in file     : 34
+UNPINNED remaining : none
+version mismatches : none
+idna resolved to   : 3.18
+```
+
+`diff` against the supplied freeze (with the paste artifact normalised) is empty:
+the repo file and the Pi environment are now identical.
+
+### Outstanding — the freeze is from a Pi 3, the target is a Pi 4
+
+The pins came from Pla2's **personal Pi 3**, but deployment is to the **company's
+Pi 4 running Kali**. Version pins are plain text and carry across machines, but
+two things are not guaranteed to:
+
+- **Architecture.** A 32-bit Pi 3 OS (`armv7l`) and 64-bit Kali on the Pi 4
+  (`aarch64`) draw different wheels. Where no wheel exists for the target,
+  `numpy`, `matplotlib` and `pillow` fall back to building from source, which on
+  a Pi is slow rather than broken.
+- **Python version.** `aiohttp` and `typing_extensions` both carry
+  `python_version` conditionals in their metadata, and a pinned version may have
+  no wheel for a different interpreter minor.
+
+Worth recording both before the deploy, on each machine:
+
+```bash
+python3 -VV && uname -m
+```
+
+Not a blocker, and nothing to change in the file until a real install failure
+says otherwise.
+
+## 2026-08-27 10:14 Pi 3 → Pi 4 portability check (closes the 10:05 outstanding item)
+
+Pla2 confirmed both machines: personal **Pi 3 on Pi OS Lite 64-bit**, company
+**Pi 4 on Kali**, **both aarch64**. That closes the architecture half of the
+10:05 outstanding item — same wheel platform, so the pins carry across directly.
+
+### Python-minor risk: measured, and it is a non-issue
+
+Resolved `requirements.txt` wheels-only against `manylinux2014_aarch64` /
+`manylinux_2_28_aarch64` for cp311, cp312 and cp313 (covering Bookworm's 3.11
+through Kali rolling's 3.13):
+
+```
+cp311 / aarch64 : all 33 packages have aarch64 wheels
+cp312 / aarch64 : all 33 packages have aarch64 wheels
+cp313 / aarch64 : all 33 packages have aarch64 wheels
+```
+
+The `aiohttp` and `typing_extensions` `python_version` conditionals flagged at
+10:05 resolve cleanly on all three. **No Python-version blocker for the deploy.**
+
+### The one exception — `PyX==0.17`
+
+33 of 34, not 34 of 34. `PyX==0.17` is **sdist-only — it has no wheel for any
+platform or interpreter**, so it builds from source wherever it is installed.
+Its metadata says `requires_python: >=3.6`, so pip will attempt the build on
+Kali's 3.13; whether a 2022-era sdist succeeds there is untested.
+
+### PyX and the whole plotting stack are unused
+
+Grepped every `.py` in the repo outside `.venv`. **Zero references** to `pyx`,
+`PyX`, `matplotlib`, `numpy`, `PIL` or `pillow` — not in `src/`, not in
+`archive/`, not in `tests/`, not even in the older unused modules.
+
+The only third-party imports anywhere are `scapy`, `mac_vendor_lookup` and
+`logstash_async`.
+
+Resolving just those three gives **23 packages, every one with a cp313 aarch64
+wheel** — a pure-wheel install needing no compiler. Against the current file that
+would drop 11 lines: `contourpy`, `cycler`, `fonttools`, `kiwisolver`,
+`matplotlib`, `numpy`, `pillow`, `pyparsing`, `python-dateutil`, `pyx`, `six`.
+
+`PyX` was most likely pulled in historically by `scapy[all]` (PyX is one of
+scapy's `all`/graphics extras, used for `psdump`/`pdfdump`). The file pins plain
+`scapy==2.7.0`, not `scapy[all]`, so it is a leftover rather than a requirement.
+
+**Nothing was changed.** Dropping 11 pinned lines is Pla2's call and was raised
+as a question, not actioned — this entry records the measurement behind it.
