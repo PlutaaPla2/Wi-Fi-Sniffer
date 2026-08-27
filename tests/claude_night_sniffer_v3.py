@@ -530,7 +530,10 @@ class DumpIeDetailsTests(unittest.TestCase):
 
     def test_rows_match_ie_sequence_and_decode(self):
         pkt = WirePacket(elements=tlv(0, b"AB") + tlv(3, b"\x06"))
-        with patch.object(ns, "IE_DETAILS_FILE", str(self.tmp_file)):
+        # The report is gated off by default, so enable it for the duration:
+        # these tests cover the report's machinery, which the gate leaves intact.
+        with patch.object(ns, "IE_DETAILS_FILE", str(self.tmp_file)), \
+             patch.object(ns, "IE_REPORT_ENABLED", True):
             ns.dump_ie_details(pkt, "2026-01-01 00:00:00", "PROBE", "AA:BB:CC:DD:EE:FF")
         with open(self.tmp_file, newline="") as fh:
             rows = list(csv.reader(fh))
@@ -545,7 +548,10 @@ class DumpIeDetailsTests(unittest.TestCase):
 
     def test_no_information_elements_writes_nothing(self):
         pkt = WirePacket()
-        with patch.object(ns, "IE_DETAILS_FILE", str(self.tmp_file)):
+        # Enabled deliberately: with the report off this would pass whatever the
+        # frame contained, which is not what the test claims to check.
+        with patch.object(ns, "IE_DETAILS_FILE", str(self.tmp_file)), \
+             patch.object(ns, "IE_REPORT_ENABLED", True):
             ns.dump_ie_details(pkt, "2026-01-01 00:00:00", "BEACON", "AA:BB:CC:DD:EE:FF")
         self.assertFalse(self.tmp_file.exists())
 
@@ -585,7 +591,8 @@ class CsvSetupTests(unittest.TestCase):
         self.assertEqual(self.tmp_file.read_text(), "not,a,header\n1,2,3\n")
 
     def test_setup_ie_csv_creates_header_when_missing(self):
-        with patch.object(ns, "IE_DETAILS_FILE", str(self.tmp_file)):
+        with patch.object(ns, "IE_DETAILS_FILE", str(self.tmp_file)), \
+             patch.object(ns, "IE_REPORT_ENABLED", True):
             ns.setup_ie_csv()
             with open(self.tmp_file, newline="") as fh:
                 rows = list(csv.reader(fh))
@@ -595,7 +602,8 @@ class CsvSetupTests(unittest.TestCase):
         # Unlike the main log, the IE report holds only the current session so it
         # can be cross-checked against the daily summary — startup wipes stale rows.
         self.tmp_file.write_text("old,session,data\n1,2,3\n")
-        with patch.object(ns, "IE_DETAILS_FILE", str(self.tmp_file)):
+        with patch.object(ns, "IE_DETAILS_FILE", str(self.tmp_file)), \
+             patch.object(ns, "IE_REPORT_ENABLED", True):
             ns.setup_ie_csv()
             with open(self.tmp_file, newline="") as fh:
                 rows = list(csv.reader(fh))

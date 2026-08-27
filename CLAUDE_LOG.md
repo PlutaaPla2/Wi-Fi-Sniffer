@@ -989,3 +989,264 @@ plus two new:
    "Frame_Hex does not move". Any future appended column will break the same way
    until the assertion expresses position. Fixed here for these two; worth a look
    at whether other tests index `CSV_FIELDS` from the end.
+
+## 2026-08-27 09:38 TASK 3 — Gate the per-IE report behind a flag
+
+Implements `prompts/TASK_3_gate_ie_report.md` in full. TASK 2 is landed
+(`e692587`), so this sits on top of it. All six preconditions verified before
+editing; none triggered a STOP.
+
+### The six edit sites, all in `src/night_sniffer_v3.py`
+
+1. `:300` — `IE_REPORT_ENABLED = False` added after the `CAPTURE_RAW_FRAMES`
+   block, with the comment recording that the report is derived data.
+2. `:562` — guard as the first statement of `setup_ie_csv()`, plus a docstring
+   line noting the no-op.
+3. `:1168` — guard as the first statement of `dump_ie_details()`, plus a
+   docstring line. The call site in `_process_frame()` was **not** touched.
+4. `:2230` — `--ie-report` argument added after `--raw-frames`, mirroring its
+   `choices=["on","off"] / default="off"` form exactly.
+5. `:2275` — the existing global block extended to three names:
+   `global TERMINAL_FRAME_FILTER, CAPTURE_RAW_FRAMES, IE_REPORT_ENABLED`.
+6. `:2137` and `:2356` — both `log.info` lines now print `off` rather than naming
+   a file that will not be written, each preserving its own column width
+   (`run_replay()` pads labels to 32, `main()` to 30; neither was reformatted).
+
+### Both guards are inside the functions, not at the call sites
+
+This is the load-bearing decision. `setup_ie_csv()` opens `IE_DETAILS_FILE` with
+mode `"w"` — it **truncates**. A call site that was missed would silently destroy
+the report from an earlier debugging run, which is the exact failure the flag
+exists to make impossible. One guard at one point of truth cannot be missed.
+Verification step 4 below is the direct test of this and it passes.
+
+The ordering requirement in 3.5 was checked, not assumed: the global block sits
+at `:2275`, the `if args.pcap:` branch at `:2296`. The assignment happens before
+replay is dispatched, so replay honours the flag — confirmed empirically, since
+every verification run below went through `--pcap`.
+
+### Verification — steps 1, 2, 3, 4, 6 (replay, on the company laptop)
+
+All against `pcap_files/20260824-1357-dumpcap-rpi6-pre-ship.pcap`, 3163 frames.
+
+**Step 1 — default is off.** Startup line reads
+`Logging IE breakdown to         : off`. Directory holds
+`wifi_full_recon_report.csv` and `daily_summary_20260827.csv`;
+`ie_details_report.csv` is **absent**.
+
+**Step 2 — the flag turns it on.** File present with its header row
+(`Timestamp,Pkt_Type,MAC_Address,IE_Index,IE_ID,IE_Name,IE_Length,IE_Raw_Hex,IE_Decoded`),
+**56 462 IE rows against the main log's 3163**.
+
+**Step 3 — the main log is byte-identical either way.** `diff` of the two runs'
+recon CSVs minus headers produced **no output**, and both files carry the same
+MD5, `a8b5e51a8080a3567c9b86ac074fee63`. This is the check proving the gate
+touched nothing it should not.
+
+**Step 4 — a disabled run does not truncate an existing report.** Copied the
+enabled run's report aside, re-ran with the report off into the same `--out-dir`,
+`diff` against the copy produced **no output**; the file stayed 6 013 389 bytes.
+The in-function guard does what it was placed there to do.
+
+**Step 6 — shipping is unaffected.** Replay with `--ship` to a loopback listener:
+`3163 queued, 0 failed`, **3163 CSV rows == 3163 events received**, envelope 45
+keys with `Timestamp_ISO` present, and `ie_details_report.csv` absent throughout.
+The IE report was never a shipping input; this confirms it. Elasticsearch
+`_count` was **not** checked — no ELK reachable from here.
+
+### Step 5's measured write volume — replay, not live
+
+The task asks for measured directory sizes on and off. **This is the replay
+measurement, not the live one** — the live run on the Pi is still outstanding.
+Two clean runs of the same 3163-frame pcap into fresh directories:
+
+```
+off total :   1093268 bytes (1.04 MiB)
+on  total :   7106659 bytes (6.78 MiB)
+delta     :   6013391 bytes (5.73 MiB)  -> 6.5x
+```
+
+**The IE report is 84.6% of everything written when it is on.** Turning it off
+cuts total write volume by a factor of **6.5**.
+
+One correction to the task document's premise, which matters for the case it
+makes: the report writes **17.85 rows per frame** (56 462 / 3163), not the "5–10
+rows per frame" the document and the new `--help` text both state. The
+justification for the task is therefore roughly twice as strong as written. The
+help text was copied verbatim as instructed and **not** corrected — flagged
+below instead.
+
+### Tests — five broke, and were fixed
+
+The task's scope-lock does not mention tests and its verification section is
+entirely end-to-end, so this was not covered either way. Five existing tests call
+the two gated functions **directly** and failed the moment the default became
+off — predicted before editing, then confirmed exactly (3 errors, 2 failures, no
+others):
+
+| Test | File |
+| --- | --- |
+| `test_ie_report_rows_reconstruct_the_body` | `tests/test_night_sniffer_v3.py` |
+| `test_truncating_the_ie_report_drops_the_cached_handle` | `tests/test_night_sniffer_v3.py` |
+| `test_rows_match_ie_sequence_and_decode` | `tests/claude_night_sniffer_v3.py` |
+| `test_setup_ie_csv_creates_header_when_missing` | `tests/claude_night_sniffer_v3.py` |
+| `test_setup_ie_csv_truncates_previous_session` | `tests/claude_night_sniffer_v3.py` |
+
+Each was fixed by adding `patch.object(..., "IE_REPORT_ENABLED", True)` alongside
+the `IE_DETAILS_FILE` patch it already used. These tests cover the report's
+**machinery**, which this task explicitly leaves intact — so they keep asserting
+exactly what they asserted before, with the feature switched on for their
+duration. No assertion was weakened or deleted.
+
+A sixth, `test_no_information_elements_writes_nothing`, would have kept **passing
+for the wrong reason**: it asserts the file does not exist, which stays true when
+the report is simply disabled, whatever the frame contained. It got the same
+patch, which restores its stated meaning. This was done on Pla2's explicit
+instruction to fix the tests per the plan report.
+
+Full CI-equivalent run after the fixes: `python3 -m compileall -q src archive
+tests` clean, **159 tests OK**. The repo still has no lint command —
+`.github/workflows/ci.yml` runs compileall, unittest, `bash -n` and a `--help`
+check only.
+
+### Scope lock — explicit confirmations
+
+`FINGERPRINT_VERSION` **not bumped** (still 2) — nothing about the hash input
+changed. `CSV_FIELDS` **unchanged at 27 entries**; `IE_CSV_FIELDS` unchanged at 9.
+**No IE machinery was deleted** — `IE_NAMES`, `_decode_ie()`, `_decode_fixed()`,
+`ACTION_CATEGORY_NAMES`, `PSEUDO_IE_FIXED` and `PSEUDO_IE_UNPARSED` are all
+untouched, as is the body of `dump_ie_details()` below the new guard.
+`apply_output_dir()` still rewrites `IE_DETAILS_FILE`, which is harmless when the
+report is off. `_writer_for()`, `_close_writer()`, `close_output_files()`,
+`_append_csv_row()` and `ship_logstash.py` untouched. No `--no-ie-report` alias
+was added and the flag does **not** default to on. **TASK 1 remains on hold** —
+`LOG_FILE` and `setup_csv()` unchanged.
+
+No git operations were run. Working tree carries three modified files for Pla2
+(`requirements.txt` was already modified before this session and is not mine).
+
+### Still outstanding — needs the Pi and the ELK box
+
+- **Step 5 live**: `--iface wlan1 --mode camp --channel 6` for ~60 s, `du -sh`
+  against a comparable `--ie-report on` run. The number above is replay-derived;
+  the task asked for the live one.
+- **Step 6's Elasticsearch `_count`**: the loopback test proves the shipper is
+  unaffected, but not that ES ingests the same count.
+
+### Suggestions / Issues noticed
+
+Carried forward, none acted on. Two new:
+
+1. **Deleting the report properly is still on the table** after a few months of
+   the flag going unused — ~300 lines across `IE_CSV_FIELDS`, `IE_NAMES`,
+   `_decode_ie()`, `_decode_fixed()`, the pseudo-IE constants and
+   `ACTION_CATEGORY_NAMES`.
+2. `setup_ie_csv()` truncates on every startup **even when enabled**, so an
+   enabled report still has no history across runs and no rotation. This matters
+   more now than before: turning the flag on is by definition a debugging
+   session, and its output is destroyed by the next run that also has the flag on.
+3. `dump_ie_details()` still receives the second-resolution `timestamp`, not
+   `timestamp_iso`, so joining IE rows to frame rows on
+   `(Timestamp, MAC_Address)` stays ambiguous within a second even now that
+   TASK 2 has landed — up to 56 candidate frames per second in this capture.
+4. `generate_session_report()` still truncate-and-rewrites the daily summary
+   every `AUTO_SAVE_INTERVAL` seconds; devices absent beyond `SESSION_TIMEOUT`
+   vanish permanently.
+5. Still open and unrelated: no SIGTERM handler, `_last_seen` never expires, and
+   sensor identity is hostname-derived with no `--sensor-id` flag.
+6. **New:** the `--help` text and the task document both say the report writes
+   "5–10 rows per frame". **Measured: 17.85.** The text was copied verbatim as
+   the task instructed, so it now understates the report's cost by about half in
+   user-facing help. Worth correcting the constant's comment and the help string
+   together, as a one-line follow-up.
+7. **New:** the test suite reaches into `setup_ie_csv()` and `dump_ie_details()`
+   directly rather than through a seam, so a runtime gate on a feature
+   immediately broke five unit tests. Same pattern as TASK 2's `CSV_FIELDS[-1]`
+   assertions. Worth deciding whether the suite should patch feature flags as a
+   matter of course, so the next gated feature does not repeat this.
+
+## 2026-08-27 09:52 Pin requirements.txt transitive dependencies
+
+Pla2 added `python-logstash-async==4.1.0` to `requirements.txt` for the TASK S1
+shipping path. The pin itself was correct — right version, right `==` form, right
+alphabetical slot, and it matches the version recorded on 2026-08-24. But it
+brought unpinned transitive dependencies into a file that pins everything else,
+so the file was rewritten to close that gap at Pla2's request.
+
+### What was wrong
+
+`requirements.txt` reads as a `pip freeze`: matplotlib's transitive dependencies
+are all pinned individually. `python-logstash-async` was not, so a clean install
+resolved **34 packages from 15 pinned lines** — 19 floating.
+
+Split by origin, which matters because only half of it was new:
+
+- **10 from `python-logstash-async`** (introduced by this addition): `certifi`,
+  `charset-normalizer`, `Deprecated`, `idna`, `limits`, `pylogbeat`, `requests`,
+  `typing_extensions`, `urllib3`, `wrapt`. Chain confirmed from package metadata:
+  `python-logstash-async` → `limits` (→ `deprecated` → `wrapt`, `packaging`,
+  `typing-extensions`), `pylogbeat`, `requests` (→ `certifi`,
+  `charset_normalizer`, `idna`, `urllib3`).
+- **9 pre-existing, from `mac-vendor-lookup`**: `aiofiles`, `aiohttp` and
+  `aiohttp`'s own tree — `aiohappyeyeballs`, `aiosignal`, `attrs`, `frozenlist`,
+  `multidict`, `propcache`, `yarl`. This gap predates the shipping work and was
+  never noticed; it was closed in the same pass.
+
+### What changed
+
+All 19 pinned at the versions a clean resolve produces today, merged into the
+existing case-insensitive alphabetical order. File went from 15 lines to 34. A
+missing trailing newline after `six==1.17.0` was also added — without it the next
+appended line risks concatenating onto that entry.
+
+**No new dependency was added.** Every one of the 19 was already being installed;
+they were simply unversioned. Verified: a clean resolve produced the same 34
+packages before and after the change. Only reproducibility changed.
+
+### Verification
+
+```
+resolves to        : 34 packages
+pinned in file     : 34
+UNPINNED remaining : none
+version mismatches : none
+```
+
+`pip install --dry-run --ignore-installed -r requirements.txt` resolves with no
+conflicts and nothing floating. The 159-test suite still passes; the file is not
+imported by anything, so this is a build-reproducibility change only.
+
+### Outstanding — versions are laptop-derived, not Pi-derived
+
+**The 19 versions came from resolving on the WSL2 laptop (x86_64, Python 3.12.3),
+not from the Pi.** The Pi is the deployment target, it is aarch64, and its venv
+was built on 2026-08-24 — so it may hold older versions than a resolve today
+produces. `python-logstash-async==4.1.0` itself is confirmed on the laptop only;
+the 4.1.0 recorded on 08-24 came from an envelope whose `interpreter` field is
+the laptop path.
+
+Pla2 to run on the Pi and paste back for correction:
+
+```bash
+cd ~/night-sniffer && .venv/bin/python3 -m pip freeze
+```
+
+Any line that disagrees should be corrected toward the Pi's value, since the Pi
+is what has to be reproducible. Until then, treat the 19 pins as provisional.
+
+### Suggestions / Issues noticed
+
+1. **`requirements.txt` has no separation between direct and transitive
+   dependencies.** With 34 flat lines it is no longer obvious that only `scapy`,
+   `mac-vendor-lookup`, `python-logstash-async` and the matplotlib/PyX plotting
+   stack are actually imported by this project. A `requirements.in` compiled to
+   `requirements.txt` (pip-tools) would keep the distinction; a comment block
+   would be the zero-dependency version.
+2. **The plotting stack may be dead weight.** `matplotlib`, `numpy`, `PyX`,
+   `contourpy`, `cycler`, `fonttools`, `kiwisolver`, `pillow`, `pyparsing` are
+   pinned but nothing in `src/night_sniffer_v3.py` imports them — they are 9 of
+   the 34 lines and by far the heaviest to install on a Pi. Worth checking
+   whether the older `src/` files still need them.
+3. `requirements.txt` pins nothing about Python itself. CI runs 3.13, the laptop
+   3.12.3, the Pi its own. Not a problem today, but `aiohttp` and
+   `typing_extensions` both carry `python_version` conditionals.

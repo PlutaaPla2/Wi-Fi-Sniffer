@@ -501,7 +501,11 @@ class NightSnifferV3LosslessTests(unittest.TestCase):
         body = bytes(12) + b"\x00\x03abc" + b"\x2d\x1a\xff"
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, "ie.csv")
-            with patch.object(night_sniffer_v3, "IE_DETAILS_FILE", path):
+            # The report is gated off by default, so enable it for the duration:
+            # this test is about the machinery being correct, not about whether
+            # the flag is on.
+            with patch.object(night_sniffer_v3, "IE_DETAILS_FILE", path), \
+                 patch.object(night_sniffer_v3, "IE_REPORT_ENABLED", True):
                 night_sniffer_v3.dump_ie_details(
                     _pkt(_wire(8, body)), "ts", "BEACON", "AA:BB"
                 )
@@ -617,7 +621,8 @@ class NightSnifferV3WriterTests(unittest.TestCase):
         import os
 
         path = os.path.join(self._tmpdir.name, "ie.csv")
-        with patch.object(night_sniffer_v3, "IE_DETAILS_FILE", path):
+        with patch.object(night_sniffer_v3, "IE_DETAILS_FILE", path), \
+             patch.object(night_sniffer_v3, "IE_REPORT_ENABLED", True):
             night_sniffer_v3._writer_for(path)
             night_sniffer_v3.setup_ie_csv()
             # A stale append handle would write past a hole at the old offset.

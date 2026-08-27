@@ -299,6 +299,14 @@ CSV_FIELDS = [
 # Set from the --raw-frames CLI flag in main().
 CAPTURE_RAW_FRAMES = False
 
+# Whether the per-IE breakdown report is written at all. Off by default: it
+# emits 5-10 rows per frame against the main log's one, and every one of those
+# rows is reconstructable from Frame_Hex - it is derived data, not evidence.
+#
+# Turn it on when a parse looks wrong and the frame body needs inspecting region
+# by region. Set from the --ie-report CLI flag in main().
+IE_REPORT_ENABLED = False
+
 # Column layout for the per-IE breakdown file (one row per information element).
 IE_CSV_FIELDS = [
     "Timestamp", "Pkt_Type", "MAC_Address", "IE_Index", "IE_ID",
@@ -559,7 +567,12 @@ def setup_ie_csv() -> None:
     truncated on every startup so it only holds the current session's IEs —
     mirroring the daily summary. That keeps the two reports aligned for
     cross-checking devices seen in the same session.
+
+    A no-op when the report is disabled, so a run without --ie-report on leaves
+    any existing report from an earlier debugging session intact.
     """
+    if not IE_REPORT_ENABLED:
+        return
     # Drop any cached append handle first: truncating the file underneath one
     # would leave later rows writing past a hole at the old offset.
     with _writer_lock:
@@ -1163,7 +1176,11 @@ def dump_ie_details(pkt, timestamp: str, pkt_type: str, mac_addr: str) -> None:
     under the pseudo-IDs below, rather than being dropped because nothing here
     knows how to decode them yet. Concatenating IE_Raw_Hex across a frame's rows
     reproduces the body exactly.
+
+    A no-op when the report is disabled.
     """
+    if not IE_REPORT_ENABLED:
+        return
     parts = _frame_parts(pkt)
     rows  = []
     index = 0
@@ -2118,7 +2135,8 @@ def run_replay(pcap_path: str, parser: argparse.ArgumentParser) -> None:
 
     log.info("Replaying capture file          : %s", pcap_path)
     log.info("Logging packets to              : %s", LOG_FILE)
-    log.info("Logging IE breakdown to         : %s", IE_DETAILS_FILE)
+    log.info("Logging IE breakdown to         : %s",
+             IE_DETAILS_FILE if IE_REPORT_ENABLED else "off")
     log.info("Terminal frame filter           : %s", TERMINAL_FRAME_FILTER)
     log.info("Raw frame bytes (Frame_Hex)     : %s",
              "on" if CAPTURE_RAW_FRAMES else "off")
@@ -2221,6 +2239,15 @@ def main() -> None:
              "log without re-capturing.",
     )
     parser.add_argument(
+        "--ie-report",
+        choices=["on", "off"],
+        default="off",
+        help="Whether to write the per-information-element breakdown report "
+             "(default: off). It writes 5-10 rows per frame and every row is "
+             "reconstructable from Frame_Hex, so it is off unless a parse needs "
+             "inspecting. Does not affect the main packet log.",
+    )
+    parser.add_argument(
         "--out-dir",
         default=None,
         help="Write all three reports into this directory instead of the "
@@ -2256,9 +2283,10 @@ def main() -> None:
     if args.hop and args.mode == "camp":
         parser.error("--hop contradicts --mode camp; pass only one of them.")
 
-    global TERMINAL_FRAME_FILTER, CAPTURE_RAW_FRAMES
+    global TERMINAL_FRAME_FILTER, CAPTURE_RAW_FRAMES, IE_REPORT_ENABLED
     TERMINAL_FRAME_FILTER = args.frames
     CAPTURE_RAW_FRAMES    = args.raw_frames == "on"
+    IE_REPORT_ENABLED     = args.ie_report == "on"
 
     if args.out_dir:
         apply_output_dir(args.out_dir)
@@ -2337,7 +2365,8 @@ def main() -> None:
 
     log.info("Starting WiFi Recon on interface: %s", iface)
     log.info("Logging packets to            : %s", LOG_FILE)
-    log.info("Logging IE breakdown to       : %s", IE_DETAILS_FILE)
+    log.info("Logging IE breakdown to       : %s",
+             IE_DETAILS_FILE if IE_REPORT_ENABLED else "off")
     log.info("Max reconnect attempts        : %d", MAX_RETRIES)
     log.info("Terminal frame filter         : %s", TERMINAL_FRAME_FILTER)
     log.info("Raw frame bytes (Frame_Hex)   : %s",
