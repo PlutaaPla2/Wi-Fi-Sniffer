@@ -133,6 +133,12 @@ PROBE_SETTLE       = 0.05   # Seconds to let the driver settle between probes
 MAX_RETRIES  = 10   # maximum reconnect attempts before giving up
 RETRY_DELAY  = 3    # seconds to wait between each attempt
 
+# An attempt that survived this long before failing was not a failing adapter,
+# so its failure does not count toward MAX_RETRIES. Without this the counter is
+# cumulative over the whole run and a long capture dies on its Nth unrelated
+# blip, hours apart, with every reset having worked.
+RETRY_RESET_SECONDS = 300
+
 # ── Capture filter ───────────────────────────────────────────────────────────
 # Applied by libpcap in the kernel, matching scripts/run_dumpcap.sh. Without it
 # every data frame on the channel is copied into userspace only to be discarded
@@ -2581,41 +2587,68 @@ def main() -> None:
     # sniff() exits silently (returns normally without raising) when the adapter
     # drops out of monitor mode — the same "Network is down" scenario we handle
     # in wifi_sniffer.py. The outer while loop detects this and calls
-    # reset_monitor_mode() before trying again, up to MAX_RETRIES times.
+    # reset_monitor_mode() before trying again, up to MAX_RETRIES consecutive
+    # times.
     # A clean Ctrl+C raises KeyboardInterrupt which breaks out of the loop
     # immediately into the final report save below.
     retry_count = 0
+
+    def _handle_capture_failure(exc: OSError | None, started: float) -> bool:
+        """Count one failed capture attempt; return False when we should stop.
+
+        An attempt that ran longer than RETRY_RESET_SECONDS clears the counter
+        first: MAX_RETRIES bounds *consecutive* failures, so a blip separated
+        from the last one by a healthy capture starts over.
+
+        Both failure paths (the silent return from sniff_filtered() and the
+        OSError) funnel through here so the reset cannot be applied to one and
+        forgotten on the other. Duration is the health signal because it is
+        available identically on both paths and needs nothing from
+        sniff_filtered().
+        """
+        nonlocal retry_count
+        # monotonic, not time.time(): an NTP step mid-run must not be readable
+        # as a long healthy attempt.
+        if time.monotonic() - started > RETRY_RESET_SECONDS:
+            retry_count = 0
+        retry_count += 1
+        if retry_count > MAX_RETRIES:
+            if exc is None:
+                log.error("Gave up after %d consecutive reconnect attempts.",
+                          MAX_RETRIES)
+            else:
+                log.error("Gave up after %d consecutive reconnect attempts: %s",
+                          MAX_RETRIES, exc)
+            return False
+        if exc is None:
+            log.warning(
+                "Capture socket closed unexpectedly. "
+                "Reconnect attempt %d/%d in %ds …",
+                retry_count, MAX_RETRIES, RETRY_DELAY,
+            )
+        else:
+            log.warning(
+                "Socket error: %s — reconnect attempt %d/%d in %ds …",
+                exc, retry_count, MAX_RETRIES, RETRY_DELAY,
+            )
+        time.sleep(RETRY_DELAY)
+        recover_interface()
+        return True
+
     try:
         while True:
+            attempt_started = time.monotonic()
             try:
                 sniff_filtered(iface=iface, prn=handle_packet, store=False)
 
                 # sniff() returned without an exception — adapter likely dropped.
-                retry_count += 1
-                if retry_count > MAX_RETRIES:
-                    log.error("Gave up after %d reconnect attempts.", MAX_RETRIES)
+                if not _handle_capture_failure(None, attempt_started):
                     break
-
-                log.warning(
-                    "Capture socket closed unexpectedly. "
-                    "Reconnect attempt %d/%d in %ds …",
-                    retry_count, MAX_RETRIES, RETRY_DELAY,
-                )
-                time.sleep(RETRY_DELAY)
-                recover_interface()
 
             except OSError as exc:
                 # Some adapter failures raise here instead of returning silently.
-                retry_count += 1
-                if retry_count > MAX_RETRIES:
-                    log.error("Gave up after %d reconnect attempts: %s", MAX_RETRIES, exc)
+                if not _handle_capture_failure(exc, attempt_started):
                     break
-                log.warning(
-                    "Socket error: %s — reconnect attempt %d/%d in %ds …",
-                    exc, retry_count, MAX_RETRIES, RETRY_DELAY,
-                )
-                time.sleep(RETRY_DELAY)
-                recover_interface()
 
     except KeyboardInterrupt:
         log.info("Interrupted – saving final session report …")

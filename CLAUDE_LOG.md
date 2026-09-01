@@ -1571,3 +1571,110 @@ Not touched.
   clock is a substitute for the timing, not for the radio.
 - Step 11's Elasticsearch `_count` against the company endpoint.
 - Re-confirm step 12's grep after deploy.
+
+---
+
+## 2026-09-01 11:33 HOTFIX — reconnect counter counts consecutive failures, not lifetime ones
+
+`prompts/TASK_retry_counter_reset.md`. Files touched: `src/night_sniffer_v3.py`
+only. Nothing else changed, no tests modified, no CLI flag added.
+
+### Preconditions
+
+Both checks in the spec held, at the line numbers it named. `retry_count` was
+assigned only at 2587 (init), 2594 and 2609 (increments), with no reset
+anywhere; `sniff_filtered(...)` at 2591 was the only call in the loop body.
+
+### The bug
+
+`retry_count` was initialised once outside `while True:` and only ever
+incremented, so it accumulated *lifetime* failures. A run that hit one transient
+drop every hour or two died on the tenth — hours after the first — with
+`Gave up after 10 reconnect attempts.`, reporting a healthy adapter as dead. The
+docstring at line 132 already claimed `MAX_RETRIES` bounded *consecutive*
+failures, so this is the code being brought back to its stated contract.
+
+### The fix
+
+- `RETRY_RESET_SECONDS = 300` added next to `MAX_RETRIES` / `RETRY_DELAY`.
+- Both failure branches now funnel through one local helper,
+  `_handle_capture_failure(exc, started)`, closing over `retry_count` with
+  `nonlocal`. An attempt that ran longer than `RETRY_RESET_SECONDS` before
+  failing clears the counter first. Factoring the two branches together is the
+  point: the reset cannot be applied to one path and forgotten on the other.
+- Duration is the health signal because it is available identically on the
+  silent-return path and the `OSError` path, and needs nothing from
+  `sniff_filtered()`, whose signature is unchanged.
+- `time.monotonic()`, never `time.time()` — an NTP step mid-run must not be
+  readable as a long healthy attempt.
+- The give-up messages now say "consecutive reconnect attempts". The block
+  comment at the loop now says "up to MAX_RETRIES consecutive times".
+
+### Verification
+
+Step 1 — `import night_sniffer_v3` exits clean; `RETRY_RESET_SECONDS = 300`,
+`MAX_RETRIES = 10` at import.
+
+Steps 2 and 3 want the radio. The counting itself was proved here without one,
+by driving the **real** `main()` loop with a fake `time.monotonic`, a stubbed
+`sniff_filtered`, and `set_channel`/`reset_monitor_mode` stubbed out — so the
+only live code under test is the retry loop. `MAX_RETRIES = 2`,
+`RETRY_RESET_SECONDS = 2`, five drops each following a healthy 10 s capture:
+
+```
+=== A  healthy runs between blips (the reported bug) ===
+  [W] Capture socket closed unexpectedly. Reconnect attempt 1/2 in 0s …   (x5)
+  --> gave up: False
+```
+
+The same scenario against the pre-fix file, for contrast:
+
+```
+=== A, BEFORE the fix ===
+  [W] Capture socket closed unexpectedly. Reconnect attempt 1/2 in 0s …
+  [W] Capture socket closed unexpectedly. Reconnect attempt 2/2 in 0s …
+  [E] Gave up after 2 reconnect attempts.
+```
+
+Before: dead on the third unrelated blip. After: five in a row, counter never
+leaving `1/2`.
+
+Step 3's invariant — a genuinely dead adapter must still terminate — holds.
+Back-to-back failures with no healthy attempt between them:
+
+```
+=== B  back-to-back failures still terminate ===
+  [W] Reconnect attempt 1/2 … / 2/2 …
+  [E] Gave up after 2 consecutive reconnect attempts.
+```
+
+Mixed case (two fast failures, one healthy 10 s capture, then fast failures
+again) logs `1/2, 2/2, 1/2, 2/2` then gives up — the counter demonstrably
+restarts at the healthy attempt, and the limit still bites afterwards. The
+`OSError` branch behaves identically to the silent-return branch.
+
+Step 4 — the existing suite is unaffected: `Ran 163 tests … OK`.
+
+No constants were edited in the source to run any of this; `MAX_RETRIES` and
+`RETRY_RESET_SECONDS` were patched on the module object, so `src/` sat at
+`10` / `300` throughout. Confirmed by grep after the run.
+
+### Outstanding — needs the Pi
+
+Spec steps 2 and 3 live on `wlan1`, forcing real drops with
+`sudo ip link set wlan1 down; sleep 1; sudo ip link set wlan1 up`. The fake
+clock substitutes for the timing, not for the adapter. Can be done in the same
+sitting as the TASK 4 runbook.
+
+### Suggestions / issues noticed (not fixed here)
+
+- `logging.basicConfig()` at line 445 still has no `%(asctime)s`, so reconnect
+  warnings carry no time and clustered vs. hours-apart retries are
+  indistinguishable in the log. That is precisely what hid this bug. One-line
+  change, worth doing next — carried over from the spec.
+- `reset_monitor_mode()` logs command failures but neither acts on them nor
+  verifies the interface came back, so a failed `ip link set up` returns
+  straight into `sniff()` blind. Out of scope, unchanged.
+- No regression test was added for the reset, since the spec did not ask for one
+  and the scope rule is to change only what was asked. The driver used above
+  could become a permanent test cheaply — say the word.
