@@ -1358,3 +1358,216 @@ scapy's `all`/graphics extras, used for `psdump`/`pdfdump`). The file pins plain
 
 **Nothing was changed.** Dropping 11 pinned lines is Pla2's call and was raised
 as a question, not actioned — this entry records the measurement behind it.
+
+---
+
+## 2026-08-31 13:01 TASK 4 — Interval-rotated packet CSV with count-based pruning
+
+Implements `prompts/TASK_4_rotation_and_pruning.md`, Parts A and B, plus one
+operator-requested addition outside the spec (see "Deviation" below). Plan report
+`explanation/20260831-1255-task4-rotation-and-pruning-plan.md`; results report
+`explanation/20260831-1301-task4-rotation-and-pruning-implemented.md`.
+
+`wifi_full_recon_report.csv` no longer exists as a path. The packet log now rolls
+onto a fixed 15-minute wall-clock boundary into
+`<LOG_DIR>/<YYYYmmdd-HHMMSS>-wifi_full_recon_report.csv`, and — when pruning is
+switched on — the oldest file is deleted each time a new one is created.
+
+### Deviation from the spec, with sign-off
+
+The spec's scope lock says "Do not add a `--log-dir`, `--rotate`,
+`--keep-files`, or `--retention` CLI flag." Pla2 explicitly asked for a pruning
+on/off switch and for `LOG_KEEP_FILES = 2` rather than the spec's `3`:
+
+> "add a simple switch flag for me. toggle a .csv pruning or not. if off, then
+> just let new .csv keep getting created every 15 mins. if on, it prune the
+> files base on how many we want to keep (2 files, which is 15 to 30 mins,
+> start delete when the 3rd file created.)"
+
+That is an instruction from the human who owns the spec, so it was implemented as
+`--prune {on,off}`. It is a *retention* toggle, not one of the four forbidden
+knobs (it exposes no directory, interval, or count) — but it is still an addition
+the spec did not authorise, and it is recorded here as a deliberate override
+rather than an oversight. `LOG_KEEP_FILES` changed 3 → 2, so the guaranteed
+window is now **15–30 minutes**, not 30–45.
+
+**Default is `off`.** This is the only code in the project that deletes captured
+data, deletion is irreversible, and a bare run should not silently destroy
+evidence. The operator opts in with `--prune on`. The consequence, stated
+plainly: **a Pi deployed without `--prune on` will fill its card at roughly
+2 GB/day.** The switch must be part of the deployment command line.
+
+### Edit sites — `src/night_sniffer_v3.py` (11)
+
+| Site | Change |
+|---|---|
+| `:12` | `import glob` |
+| `:42` | Block-header example retargeted `LOG_FILE` → `LOG_DIR` (the old example set a path that can no longer be set) |
+| `:46-80` | Config: `LOG_DIR`, `LOG_PREFIX`, `LOG_ROTATE_SECONDS`, `LOG_KEEP_FILES`, `LOG_PRUNE_ENABLED`, `LOG_FILE = ""` replacing the single `LOG_FILE` constant |
+| `:547-565` | `apply_output_dir()` — redirects `LOG_DIR`, not `LOG_FILE`; docstring updated |
+| `:594-597` | New `_log_bucket_ts` module global |
+| `:600` | New `_log_bucket()` |
+| `:605` | New `build_log_path()` |
+| `:617` | New `_prune_old_logs()` |
+| `:659` | New `_open_new_log()` |
+| `:677` | New `init_log_file()` |
+| — | `setup_csv()` **deleted** |
+| `:2268`, `:2498` | Both former `setup_csv()` call sites → `init_log_file()` (`run_replay()` and `main()`) |
+| `:1802-1819` | `_append_csv_row()` — rotation check under `_writer_lock` |
+| `:2374` | New `--prune {on,off}` argument, default `off` |
+| `:2455-2461` | `global LOG_PRUNE_ENABLED` + assignment from `args.prune` |
+| `:2500-2506` | `main()` startup log: rotation interval and retention window |
+
+`run_replay()`'s `log.info` line was left exactly as it was, per the spec.
+
+### Facts the spec asked to be recorded
+
+- **`CSV_FIELDS` is 27 and unchanged**, still ending in `Timestamp_ISO`, still
+  with `Frame_Hex` at index 25. No column was added, moved, or renamed.
+- **`LOG_FILE` is now `""` until `init_log_file()` runs.** Importing the module
+  and calling `_append_csv_row()` without initialising it does not raise — it
+  takes the rotation branch on the first row and creates the file itself. Any
+  future tooling that imports this module must call `init_log_file()`.
+- **Rotation is checked inside `_append_csv_row()`, under `_writer_lock`.** No
+  background thread was added. That function is already the only place rows are
+  written and already takes the lock, so the check costs two arithmetic
+  operations per row and cannot race the writer. A timer thread would have needed
+  the same lock and would have introduced a roll that can happen with no row to
+  write.
+- **Pruning is called from `_open_new_log()` only.** That is the exact and only
+  moment a new file appears, so the count is bounded at every point where it
+  could have grown. Nowhere else needs to check.
+- **`FINGERPRINT_VERSION` was NOT bumped.** Nothing about the hash input changed.
+- **`ie_details_report.csv` and the daily summary were NOT touched.** Not
+  rotated, not pruned, not gated. Their retention remains the unsettled PM
+  conversation.
+- **No delivery check of any kind was added.** No Elasticsearch query, no spool
+  inspection, no ack watermark. `SHIP_DB_PATH` is untouched and still `None`.
+- **Exactly one deletion call exists in the module** (`os.remove` at `:653`),
+  reached only through the glob `<LOG_DIR>/*-<LOG_PREFIX>.csv`, with the active
+  `LOG_FILE` excluded explicitly. No wildcard `rm`, no `shutil`, no `rmtree`, no
+  directory removal, nothing outside `LOG_DIR`.
+
+### Verification — synthetic clock, replay, and unit tests
+
+Live radio steps still require the Pi (listed as outstanding below). Everything
+timing-dependent was run here with `time.time` patched, so five 60-second
+intervals elapse in milliseconds and `LOG_ROTATE_SECONDS` was **never edited** —
+it sat at `900` in the source throughout, removing the risk of shipping a test
+value. Driver: `scratchpad/rotdrv.py`.
+
+**Step 4 verbatim — the file count is held at `LOG_KEEP_FILES`.** Five intervals
+simulated, `--prune on`, `LOG_KEEP_FILES = 2`:
+
+```
+[INFO] Pruned rotated log: 20260101-070000-wifi_full_recon_report.csv
+[INFO] Pruned rotated log: 20260101-070100-wifi_full_recon_report.csv
+[INFO] Pruned rotated log: 20260101-070200-wifi_full_recon_report.csv
+FILES: 2
+   20260101-070300-wifi_full_recon_report.csv
+   20260101-070400-wifi_full_recon_report.csv
+```
+
+Three `Pruned rotated log:` lines for five files created — the first deletion
+happens when the **third** file is created, exactly as requested.
+
+**Step 5 verbatim — the right files survived.** The two remaining are the two
+newest, and the newest (`070400`) is the one that was still being written when
+the run ended. No earlier file survived; no later file was removed.
+
+**Step 2 — one header per file, 27 columns:**
+
+```
+20260101-070000-...csv: 1 header(s), 60 rows, 27 cols
+20260101-070100-...csv: 1 header(s), 60 rows, 27 cols
+20260101-070200-...csv: 1 header(s), 60 rows, 27 cols
+20260101-070300-...csv: 1 header(s), 60 rows, 27 cols
+20260101-070400-...csv: 1 header(s), 60 rows, 27 cols
+```
+
+**Step 3 — every stamp boundary-aligned** at 60 s: `070000 070100 070200 070300
+070400`, all ending in `00`.
+
+**Step 7 — restart mid-interval appends, no double header.** Simulated a process
+death and restart 130 s in (mid-way through the third interval): the file
+restarted into holds **1 header and 60 rows**, contiguous `row120`–`row179`. Across
+all five files, **300 rows for 300 simulated seconds — no row lost, none
+duplicated.**
+
+**Step 10 — pruning can be disabled.** Two independent off-switches, each tested:
+`--prune off` leaves all 5 files with no `Pruned` line; `LOG_KEEP_FILES = 0` with
+pruning on also leaves all 5. They are guarded separately so a misconfigured `0`
+cannot be read as "keep none of them".
+
+**Step 8 — replay writes a single file and prunes nothing.** Replaying
+`20260824-1357-dumpcap-rpi6-pre-ship.pcap` to a fresh `--out-dir`: **1 file,
+3163 rows, 1 header, 27 columns, 0 `Pruned` lines**, no exception. The
+`REPLAY_MODE` guard holds.
+
+**Step 9 — clean directory and `--out-dir` both work.** Directory created on
+demand, no `FileNotFoundError`, no `IsADirectoryError`.
+
+**Step 11 — shipping is unaffected.** Replay with `--ship` to a loopback
+listener. **3163 CSV rows, 3163 events actually received on the wire, all 3163
+valid JSON, 0 malformed.** This is a real receive count, not `ship_stats()` —
+that counter has now falsely reported success three times and is not evidence.
+The Elasticsearch `_count` proper still needs the company endpoint.
+
+**Step 12 — production values confirmed by grep:**
+
+```
+53:LOG_DIR            = "./csv_analyze"
+54:LOG_PREFIX         = "wifi_full_recon_report"
+55:LOG_ROTATE_SECONDS = 900
+68:LOG_KEEP_FILES     = 2
+78:LOG_PRUNE_ENABLED  = False
+80:LOG_FILE           = ""
+```
+
+`LOG_ROTATE_SECONDS` is `900` and `LOG_KEEP_FILES` is `2` — the requested value,
+not the spec's `3`.
+
+### Tests — 163 passing (was 153)
+
+Five existing tests broke, exactly as predicted in the plan report. One of them
+mattered beyond the assertion: `test_append_csv_row_appends_after_header` and
+`test_rows_are_flushed_...` both patched `LOG_FILE`, which the new rotation
+branch reassigns on the first row — so the patch was silently defeated and rows
+would have landed in the **real** `./csv_analyze/`. On this box that raised
+instead (no such directory); on the Pi it would have written stray files into
+live output during a test run.
+
+Repaired by retargeting at the new API rather than by dodging it:
+
+- `test_setup_csv_creates_header_when_missing` → `test_init_log_file_creates_header_when_missing`, patching `LOG_DIR`
+- `test_setup_csv_does_not_clobber_existing_file` → `test_init_log_file_does_not_clobber_the_current_interval` — now asserts the real invariant (step 7) as a unit test
+- `test_append_csv_row_appends_after_header` — patches `LOG_DIR`, exercises the live rotation branch instead of avoiding it
+- `test_rows_are_flushed_so_a_reader_sees_them_immediately` — pins `REPLAY_MODE = True` so the row lands in the patched path verbatim; rotation is covered separately
+- `test_redirects_all_three_outputs_and_keeps_basenames` — asserts `LOG_DIR == target`; the packet log's basename is no longer preserved by design
+
+Ten new tests added, in two classes:
+
+- `LogRotationTests` (3) — bucket snaps to the interval start; every instant in an
+  interval maps to one filename; filenames sort chronologically as plain strings
+  (load-bearing, since the pruner sorts lexicographically and never parses a name)
+- `LogPruningTests` (7) — keeps the newest N; no-op until the count is exceeded;
+  the switch off deletes nothing; `keep=0` deletes nothing; **never deletes the
+  active file** even when it does not sort last; **ignores files it did not name**
+  (`ie_details_report.csv` and `daily_summary_*.csv` seeded alongside and asserted
+  to survive); and an end-to-end pass through `_open_new_log()` across four
+  boundaries leaving exactly `LOG_KEEP_FILES` behind.
+
+The pruner tests exist because this is the first deleting code in the project and
+its guards are otherwise only exercised by luck.
+
+`tests/test_randomized_session_counter.py` fails on direct invocation with
+`ModuleNotFoundError: No module named 'config'`. **Pre-existing and unrelated** —
+it imports the old unused `src/config.py`. It passes under `unittest discover`.
+Not touched.
+
+### Outstanding — needs the Pi
+
+- Steps 1, 4, 5, 6 and 10 live on `wlan1` with real 5-minute runs. The synthetic
+  clock is a substitute for the timing, not for the radio.
+- Step 11's Elasticsearch `_count` against the company endpoint.
+- Re-confirm step 12's grep after deploy.

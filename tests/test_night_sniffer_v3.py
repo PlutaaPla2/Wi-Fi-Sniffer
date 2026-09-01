@@ -608,11 +608,15 @@ class NightSnifferV3WriterTests(unittest.TestCase):
 
     def test_rows_are_flushed_so_a_reader_sees_them_immediately(self):
         # tail -f during a capture, and a hard power-off, both depend on this.
+        # REPLAY_MODE is forced on so the row lands in the patched LOG_FILE
+        # verbatim: the live path would roll the file and rename it first, which
+        # is covered separately in the rotation tests.
         import csv as csv_mod
         import os
 
         path = os.path.join(self._tmpdir.name, "report.csv")
-        with patch.object(night_sniffer_v3, "LOG_FILE", path):
+        with patch.object(night_sniffer_v3, "LOG_FILE", path), \
+             patch.object(night_sniffer_v3, "REPLAY_MODE", True):
             night_sniffer_v3._append_csv_row(["a", "b"])
             with open(path, newline="") as fh:
                 self.assertEqual(list(csv_mod.reader(fh)), [["a", "b"]])
@@ -634,28 +638,32 @@ class NightSnifferV3OutputDirTests(unittest.TestCase):
 
     def setUp(self):
         self._paths = (
-            night_sniffer_v3.LOG_FILE,
+            night_sniffer_v3.LOG_DIR,
             night_sniffer_v3.IE_DETAILS_FILE,
             night_sniffer_v3.SUMMARY_DIR,
         )
 
     def tearDown(self):
-        (night_sniffer_v3.LOG_FILE,
+        (night_sniffer_v3.LOG_DIR,
          night_sniffer_v3.IE_DETAILS_FILE,
          night_sniffer_v3.SUMMARY_DIR) = self._paths
 
     def test_redirects_all_three_outputs_and_keeps_basenames(self):
+        # The packet log is redirected by directory, not filename, because its
+        # filename is assembled per rotation interval. Moving LOG_DIR is also
+        # what confines the pruner's glob to the replay's own directory, so a
+        # replay cannot delete a live capture's files.
         import os
         import tempfile
 
-        original_log = os.path.basename(night_sniffer_v3.LOG_FILE)
         original_ie = os.path.basename(night_sniffer_v3.IE_DETAILS_FILE)
         with tempfile.TemporaryDirectory() as tmp:
             target = os.path.join(tmp, "made", "on", "demand")
             night_sniffer_v3.apply_output_dir(target)
             self.assertTrue(os.path.isdir(target))
-            self.assertEqual(night_sniffer_v3.LOG_FILE,
-                             os.path.join(target, original_log))
+            self.assertEqual(night_sniffer_v3.LOG_DIR, target)
+            self.assertEqual(
+                os.path.dirname(night_sniffer_v3.build_log_path(0.0)), target)
             self.assertEqual(night_sniffer_v3.IE_DETAILS_FILE,
                              os.path.join(target, original_ie))
             self.assertEqual(night_sniffer_v3.SUMMARY_DIR, target)

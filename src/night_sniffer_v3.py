@@ -9,6 +9,7 @@ import sys
 import time
 import threading
 import csv
+import glob
 import math
 import logging
 import hashlib
@@ -39,9 +40,44 @@ INTERFACE          = "wlan1"
 
 # ── Output file paths (edit these to change where CSVs are written) ──────────
 # Use an absolute path to write outside the working directory, e.g.:
-#   LOG_FILE        = "/home/pi/logs/wifi_full_recon_report.csv"
+#   LOG_DIR         = "/home/pi/logs"
 #   SUMMARY_DIR     = "/home/pi/logs"
-LOG_FILE           = "./csv_analyze/wifi_full_recon_report.csv"   # main per-packet log
+# Main per-packet log, rotated on a fixed wall-clock interval. Files are named
+#   <LOG_DIR>/<YYYYmmdd-HHMMSS>-<LOG_PREFIX>.csv
+# with the stamp being the START of the interval, not the moment of the first
+# write - so filenames are deterministic, sort chronologically under a plain
+# `ls`, and two sensors rolling on the same boundary produce matching names.
+#
+# A file is immutable once it rolls. NEVER prune rows from inside one; retention
+# deletes whole closed files (see LOG_KEEP_FILES below).
+LOG_DIR            = "./csv_analyze"           # directory holding rotated logs
+LOG_PREFIX         = "wifi_full_recon_report"  # name suffix after the timestamp
+LOG_ROTATE_SECONDS = 900                       # roll on this boundary (15 min)
+
+# How many rotated packet logs to keep, INCLUDING the one being written. The
+# oldest is deleted each time a new file is created, so retention is counted in
+# files rather than measured in seconds.
+#
+# Counted, not aged, on purpose: rotation only rolls when a row arrives, so an
+# idle sensor creates no new file. An age-based pruner would delete everything
+# during a quiet night; a count-based one cannot.
+#
+# The window this guarantees is (LOG_KEEP_FILES - 1) * LOG_ROTATE_SECONDS at
+# minimum and LOG_KEEP_FILES * LOG_ROTATE_SECONDS at most - with the defaults,
+# between 15 and 30 minutes. Deletion begins when the 3rd file is created.
+LOG_KEEP_FILES     = 2
+
+# Master switch for pruning. Off by default: this is the only code in the
+# project that deletes captured data, and deletion is not reversible, so a bare
+# run keeps every rotated file and the operator opts in explicitly.
+#
+# Off  -> files keep rolling every LOG_ROTATE_SECONDS and nothing is removed.
+#         The card fills at roughly 2 GB/day; this is for short investigations.
+# On   -> the oldest is removed once more than LOG_KEEP_FILES exist.
+# Set from the --prune CLI flag in main().
+LOG_PRUNE_ENABLED  = False
+
+LOG_FILE           = ""                        # active file; set by init_log_file()
 IE_DETAILS_FILE    = "./csv_analyze/ie_details_report.csv"        # one row per information element
 SUMMARY_DIR        = "./csv_analyze/"                             # directory for daily_summary_DATE.csv files
 SUMMARY_PREFIX     = "daily_summary"                 # filename prefix (date appended automatically)
@@ -502,18 +538,23 @@ except Exception:
 
 def apply_output_dir(out_dir: str) -> None:
     """
-    Redirect all three report files into ``out_dir``, creating it if needed.
+    Redirect all three report outputs into ``out_dir``, creating it if needed.
 
     Exists so a replay can be written somewhere other than the live capture's
-    output. Without it, replaying a pcap would append to the accumulating
-    wifi_full_recon_report.csv and — worse — setup_ie_csv() opens the per-IE
-    report with mode "w", so a replay would truncate the IE breakdown belonging
-    to a real capture. Basenames are kept exactly as configured above so the
-    parity tooling and fingerprint_baseline.py find the same filenames.
+    output. Without it, replaying a pcap would append to the accumulating packet
+    log and — worse — setup_ie_csv() opens the per-IE report with mode "w", so a
+    replay would truncate the IE breakdown belonging to a real capture.
+
+    The packet log is redirected by moving its *directory*, not its filename,
+    because the filename is now assembled per rotation interval by
+    build_log_path() rather than being a fixed constant. Redirecting LOG_DIR
+    also keeps the pruner's glob confined to the same directory it writes into,
+    so a replay can never prune a live capture's files. The IE report keeps its
+    basename exactly as configured above so the parity tooling finds it.
     """
-    global LOG_FILE, IE_DETAILS_FILE, SUMMARY_DIR
+    global LOG_DIR, IE_DETAILS_FILE, SUMMARY_DIR
     os.makedirs(out_dir, exist_ok=True)
-    LOG_FILE        = os.path.join(out_dir, os.path.basename(LOG_FILE))
+    LOG_DIR         = out_dir
     IE_DETAILS_FILE = os.path.join(out_dir, os.path.basename(IE_DETAILS_FILE))
     SUMMARY_DIR     = out_dir
 
@@ -550,13 +591,94 @@ def close_output_files() -> None:
             _close_writer(path)
 
 
-def setup_csv() -> None:
-    """Create CSV with header row if the file does not yet exist."""
-    with _writer_lock:
+# Start of the interval the active LOG_FILE belongs to. Compared against the
+# current bucket on every row; only ever read or written while holding
+# _writer_lock, which is the same lock the row write itself takes.
+_log_bucket_ts: float | None = None
+
+
+def _log_bucket(now: float) -> float:
+    """Return the start of the LOG_ROTATE_SECONDS interval containing ``now``."""
+    return now - (now % LOG_ROTATE_SECONDS)
+
+
+def build_log_path(bucket_ts: float) -> str:
+    """Return the CSV path for the interval starting at ``bucket_ts``.
+
+    Date-first so `ls` orders files chronologically — which is also what makes
+    the pruner's sort correct without parsing filenames. Boundary-aligned stamps
+    mean a given interval always maps to the same filename, so a re-created file
+    appends rather than silently starting a second one.
+    """
+    stamp = time.strftime("%Y%m%d-%H%M%S", time.localtime(bucket_ts))
+    return os.path.join(LOG_DIR, f"{stamp}-{LOG_PREFIX}.csv")
+
+
+def _prune_old_logs() -> None:
+    """Delete all but the newest LOG_KEEP_FILES rotated packet logs.
+
+    A no-op unless LOG_PRUNE_ENABLED, so a bare run never deletes anything: this
+    is the only code in the project that removes captured data and the operator
+    opts in to it explicitly via --prune on.
+
+    Caller MUST hold _writer_lock. Called from _open_new_log(), which is the
+    exact moment a new file appears — so the file count is bounded at every
+    point where it could have grown, and nowhere else needs to check.
+
+    Deliberately narrow about what it will delete. The glob matches only files
+    this module names, and the active LOG_FILE is excluded explicitly rather
+    than relied upon to sort last. Sorting is lexicographic, which is
+    chronological because build_log_path() writes the stamp date-first.
+
+    A failure to delete is logged and skipped, never raised: a stale file is a
+    disk-space problem, while an exception escaping here would reach the packet
+    callback and cost frames.
+    """
+    if not LOG_PRUNE_ENABLED or LOG_KEEP_FILES <= 0:
+        return
+
+    pattern = os.path.join(LOG_DIR, f"*-{LOG_PREFIX}.csv")
+    files   = sorted(glob.glob(pattern))
+    if len(files) <= LOG_KEEP_FILES:
+        return
+
+    for path in files[:-LOG_KEEP_FILES]:
+        if path == LOG_FILE:
+            # Cannot happen while the active file sorts last, which it does.
+            # Kept as a guard because the cost of being wrong here is deleting
+            # the file currently being written.
+            continue
+        try:
+            _close_writer(path)
+            os.remove(path)
+            log.info("Pruned rotated log: %s", os.path.basename(path))
+        except OSError as exc:
+            log.warning("Could not prune %s: %s", path, exc)
+
+
+def _open_new_log(bucket_ts: float) -> None:
+    """Point LOG_FILE at ``bucket_ts``'s file, closing the previous one.
+
+    Caller MUST hold _writer_lock. The header is written only when the file does
+    not already exist, so a restart mid-interval appends to the same file
+    instead of adding a second header row.
+    """
+    global LOG_FILE, _log_bucket_ts
+    if LOG_FILE:
         _close_writer(LOG_FILE)
+    _log_bucket_ts = bucket_ts
+    LOG_FILE = build_log_path(bucket_ts)
     if not os.path.exists(LOG_FILE):
         with open(LOG_FILE, "w", newline="") as fh:
             csv.writer(fh).writerow(CSV_FIELDS)
+    _prune_old_logs()
+
+
+def init_log_file() -> None:
+    """Create LOG_DIR and open the log file for the current interval."""
+    os.makedirs(LOG_DIR, exist_ok=True)
+    with _writer_lock:
+        _open_new_log(_log_bucket(time.time()))
 
 
 def setup_ie_csv() -> None:
@@ -1666,8 +1788,21 @@ def generate_session_report() -> None:
 
 
 def _append_csv_row(row: list) -> None:
-    """Thread-safe append of a single row to the main log file."""
+    """Thread-safe append of a single row, rolling the file on interval change.
+
+    Rotation is checked here rather than on a timer thread: this is already the
+    only place rows are written and it already holds _writer_lock, so the check
+    costs two arithmetic operations per row and cannot race the writer.
+
+    The REPLAY_MODE guard keeps --pcap writing to a single file. Rotating replay
+    on the wall clock while its rows carry pcap timestamps would produce files
+    whose names contradict their contents.
+    """
     with _writer_lock:
+        if not REPLAY_MODE:
+            bucket = _log_bucket(time.time())
+            if bucket != _log_bucket_ts:
+                _open_new_log(bucket)
         handle = _writer_for(LOG_FILE)
         csv.writer(handle).writerow(row)
         handle.flush()
@@ -2130,7 +2265,7 @@ def run_replay(pcap_path: str, parser: argparse.ArgumentParser) -> None:
         parser.error(f"--pcap: no such file: {pcap_path}")
 
     REPLAY_MODE = True
-    setup_csv()
+    init_log_file()
     setup_ie_csv()
 
     log.info("Replaying capture file          : %s", pcap_path)
@@ -2248,6 +2383,20 @@ def main() -> None:
              "inspecting. Does not affect the main packet log.",
     )
     parser.add_argument(
+        "--prune",
+        choices=["on", "off"],
+        default="off",
+        help=f"Whether to delete old rotated packet logs (default: off). Off "
+             f"keeps every {LOG_ROTATE_SECONDS // 60}-minute file and the disk "
+             f"fills at roughly 2 GB/day. On keeps the newest "
+             f"{LOG_KEEP_FILES} files, deleting the oldest each time a new one "
+             f"is created - a retention window of "
+             f"{(LOG_KEEP_FILES - 1) * LOG_ROTATE_SECONDS // 60}-"
+             f"{LOG_KEEP_FILES * LOG_ROTATE_SECONDS // 60} minutes. Deleted "
+             f"rows are gone; anything already shipped to Logstash is not "
+             f"affected. Ignored in --pcap replay, which does not rotate.",
+    )
+    parser.add_argument(
         "--out-dir",
         default=None,
         help="Write all three reports into this directory instead of the "
@@ -2284,9 +2433,11 @@ def main() -> None:
         parser.error("--hop contradicts --mode camp; pass only one of them.")
 
     global TERMINAL_FRAME_FILTER, CAPTURE_RAW_FRAMES, IE_REPORT_ENABLED
+    global LOG_PRUNE_ENABLED
     TERMINAL_FRAME_FILTER = args.frames
     CAPTURE_RAW_FRAMES    = args.raw_frames == "on"
     IE_REPORT_ENABLED     = args.ie_report == "on"
+    LOG_PRUNE_ENABLED     = args.prune == "on"
 
     if args.out_dir:
         apply_output_dir(args.out_dir)
@@ -2360,11 +2511,17 @@ def main() -> None:
         band = args.band or (prompt_band() if interactive else DEFAULT_BAND)
         hop_channels = build_hop_channels(band)
 
-    setup_csv()
+    init_log_file()
     setup_ie_csv()
 
     log.info("Starting WiFi Recon on interface: %s", iface)
     log.info("Logging packets to            : %s", LOG_FILE)
+    log.info("Log rotation                  : every %ds", LOG_ROTATE_SECONDS)
+    log.info("Log retention                 : %s",
+             f"{LOG_KEEP_FILES} files "
+             f"(>= {(LOG_KEEP_FILES - 1) * LOG_ROTATE_SECONDS // 60} min)"
+             if LOG_PRUNE_ENABLED and LOG_KEEP_FILES > 0
+             else "unlimited (pruning off)")
     log.info("Logging IE breakdown to       : %s",
              IE_DETAILS_FILE if IE_REPORT_ENABLED else "off")
     log.info("Max reconnect attempts        : %d", MAX_RETRIES)

@@ -14,6 +14,7 @@ run directly with:
 
 import csv
 import importlib
+import time
 import sys
 import types
 import unittest
@@ -569,10 +570,15 @@ class CsvSetupTests(unittest.TestCase):
     def tearDown(self):
         self._tmpdir.cleanup()
 
-    def test_setup_csv_creates_header_when_missing(self):
-        with patch.object(ns, "LOG_FILE", str(self.tmp_file)):
-            ns.setup_csv()
-            with open(self.tmp_file, newline="") as fh:
+    def test_init_log_file_creates_header_when_missing(self):
+        # setup_csv() was replaced by init_log_file(), which names the file from
+        # the rotation bucket rather than a fixed LOG_FILE - so the directory is
+        # what gets patched, and the resulting path is read back off the module.
+        with patch.object(ns, "LOG_DIR", self._tmpdir.name), \
+             patch.object(ns, "LOG_FILE", ""), \
+             patch.object(ns, "_log_bucket_ts", None):
+            ns.init_log_file()
+            with open(ns.LOG_FILE, newline="") as fh:
                 rows = list(csv.reader(fh))
         self.assertEqual(rows, [ns.CSV_FIELDS])
         # Frame_Hex holds a fixed position so appending it did not move any
@@ -584,11 +590,17 @@ class CsvSetupTests(unittest.TestCase):
         for column in ("Seq_Num", "Direction", "Reason_Code"):
             self.assertIn(column, ns.CSV_FIELDS)
 
-    def test_setup_csv_does_not_clobber_existing_file(self):
-        self.tmp_file.write_text("not,a,header\n1,2,3\n")
-        with patch.object(ns, "LOG_FILE", str(self.tmp_file)):
-            ns.setup_csv()
-        self.assertEqual(self.tmp_file.read_text(), "not,a,header\n1,2,3\n")
+    def test_init_log_file_does_not_clobber_the_current_interval(self):
+        # A restart mid-interval must append to the file already covering that
+        # interval, not truncate it and not add a second header row.
+        with patch.object(ns, "LOG_DIR", self._tmpdir.name), \
+             patch.object(ns, "LOG_FILE", ""), \
+             patch.object(ns, "_log_bucket_ts", None):
+            existing = ns.build_log_path(ns._log_bucket(time.time()))
+            Path(existing).write_text("not,a,header\n1,2,3\n")
+            ns.init_log_file()
+            self.assertEqual(ns.LOG_FILE, existing)
+        self.assertEqual(Path(existing).read_text(), "not,a,header\n1,2,3\n")
 
     def test_setup_ie_csv_creates_header_when_missing(self):
         with patch.object(ns, "IE_DETAILS_FILE", str(self.tmp_file)), \
@@ -610,15 +622,150 @@ class CsvSetupTests(unittest.TestCase):
         self.assertEqual(rows, [ns.IE_CSV_FIELDS])
 
     def test_append_csv_row_appends_after_header(self):
-        self.tmp_file.write_text("")
-        with open(self.tmp_file, "w", newline="") as fh:
-            csv.writer(fh).writerow(ns.CSV_FIELDS)
-        with patch.object(ns, "LOG_FILE", str(self.tmp_file)):
+        # LOG_DIR is patched rather than LOG_FILE: the live path now rolls the
+        # file inside _append_csv_row(), reassigning LOG_FILE, so patching the
+        # filename would be silently defeated on the very first row.
+        with patch.object(ns, "LOG_DIR", self._tmpdir.name), \
+             patch.object(ns, "LOG_FILE", ""), \
+             patch.object(ns, "_log_bucket_ts", None):
+            ns.init_log_file()
             ns._append_csv_row(["ts", "PROBE", "AA:BB", "Real"] + [""] * (len(ns.CSV_FIELDS) - 4))
-        with open(self.tmp_file, newline="") as fh:
+            path = ns.LOG_FILE
+            ns.close_output_files()
+        with open(path, newline="") as fh:
             rows = list(csv.reader(fh))
         self.assertEqual(len(rows), 2)
+        self.assertEqual(rows[0], ns.CSV_FIELDS)
         self.assertEqual(rows[1][:4], ["ts", "PROBE", "AA:BB", "Real"])
+
+
+# ---------------------------------------------------------------------------
+# Log rotation and count-based pruning
+# ---------------------------------------------------------------------------
+
+class LogRotationTests(unittest.TestCase):
+    """Interval bucketing and filename assembly. Pure arithmetic and strings."""
+
+    def test_bucket_snaps_to_the_interval_start(self):
+        with patch.object(ns, "LOG_ROTATE_SECONDS", 900):
+            # A timestamp mid-interval belongs to the interval's start, not to
+            # its own second.
+            self.assertEqual(ns._log_bucket(1_000_000_450.0), 999_999_900.0)
+            for now, expected in ((900.0, 900.0), (901.0, 900.0),
+                                  (1799.9, 900.0), (1800.0, 1800.0)):
+                self.assertEqual(ns._log_bucket(now), expected)
+
+    def test_every_instant_in_an_interval_maps_to_one_filename(self):
+        # This is what makes a restart mid-interval append instead of starting a
+        # second file for the same window.
+        with patch.object(ns, "LOG_ROTATE_SECONDS", 900), \
+             patch.object(ns, "LOG_DIR", "/tmp/x"):
+            names = {ns.build_log_path(ns._log_bucket(900.0 + off))
+                     for off in (0, 1, 450, 899.999)}
+        self.assertEqual(len(names), 1)
+
+    def test_filenames_sort_chronologically_as_plain_strings(self):
+        # The pruner sorts lexicographically and never parses a filename, so
+        # date-first naming is load-bearing, not cosmetic.
+        with patch.object(ns, "LOG_ROTATE_SECONDS", 900), \
+             patch.object(ns, "LOG_DIR", "/tmp/x"), \
+             patch.object(ns, "LOG_PREFIX", "wifi_full_recon_report"):
+            buckets = [ns._log_bucket(t) for t in
+                       (1_700_000_000.0, 1_700_090_000.0, 1_700_900_000.0)]
+            paths = [ns.build_log_path(b) for b in buckets]
+        self.assertEqual(paths, sorted(paths))
+        for path in paths:
+            self.assertTrue(path.endswith("-wifi_full_recon_report.csv"))
+
+
+class LogPruningTests(unittest.TestCase):
+    """The only code in the project that deletes captured data."""
+
+    def setUp(self):
+        import tempfile
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self.dir = self._tmpdir.name
+
+    def tearDown(self):
+        ns.close_output_files()
+        self._tmpdir.cleanup()
+
+    def _seed(self, count):
+        """Create ``count`` rotated logs with ascending, boundary-aligned names."""
+        paths = []
+        for i in range(count):
+            path = Path(self.dir) / f"2026010{i}-000000-wifi_full_recon_report.csv"
+            path.write_text("header\n")
+            paths.append(str(path))
+        return paths
+
+    def _prune(self, active, *, enabled=True, keep=2):
+        with patch.object(ns, "LOG_DIR", self.dir), \
+             patch.object(ns, "LOG_PREFIX", "wifi_full_recon_report"), \
+             patch.object(ns, "LOG_KEEP_FILES", keep), \
+             patch.object(ns, "LOG_PRUNE_ENABLED", enabled), \
+             patch.object(ns, "LOG_FILE", active):
+            ns._prune_old_logs()
+        return sorted(str(p) for p in Path(self.dir).glob("*.csv"))
+
+    def test_keeps_the_newest_n_and_deletes_the_rest(self):
+        paths = self._seed(5)
+        self.assertEqual(self._prune(paths[-1]), paths[-2:])
+
+    def test_no_op_until_the_count_is_exceeded(self):
+        # With keep=2 the third file's creation is the first deletion.
+        paths = self._seed(2)
+        self.assertEqual(self._prune(paths[-1]), paths)
+
+    def test_disabled_switch_deletes_nothing(self):
+        paths = self._seed(6)
+        self.assertEqual(self._prune(paths[-1], enabled=False), paths)
+
+    def test_keep_zero_deletes_nothing(self):
+        # Guarded separately from the switch so a misconfigured 0 cannot be read
+        # as "keep none of them".
+        paths = self._seed(6)
+        self.assertEqual(self._prune(paths[-1], keep=0), paths)
+
+    def test_never_deletes_the_active_file(self):
+        # The active file sorts last so it should never be a candidate; this
+        # asserts the explicit guard holds even when it is not, because the cost
+        # of being wrong is deleting the file currently being written.
+        paths = self._seed(5)
+        survivors = self._prune(paths[0], keep=1)
+        self.assertIn(paths[0], survivors)
+        self.assertIn(paths[-1], survivors)
+
+    def test_ignores_files_it_did_not_name(self):
+        # ie_details_report.csv and the daily summary live in the same directory
+        # and are explicitly out of scope.
+        paths = self._seed(5)
+        bystanders = []
+        for name in ("ie_details_report.csv", "daily_summary_2026-01-01.csv"):
+            other = Path(self.dir) / name
+            other.write_text("x")
+            bystanders.append(str(other))
+        survivors = self._prune(paths[-1])
+        for path in bystanders:
+            self.assertIn(path, survivors)
+
+    def test_a_rolled_file_is_bounded_at_the_moment_it_is_created(self):
+        # End to end through _open_new_log(), which is the only caller: crossing
+        # four boundaries must leave exactly LOG_KEEP_FILES files behind.
+        with patch.object(ns, "LOG_DIR", self.dir), \
+             patch.object(ns, "LOG_ROTATE_SECONDS", 60), \
+             patch.object(ns, "LOG_KEEP_FILES", 2), \
+             patch.object(ns, "LOG_PRUNE_ENABLED", True), \
+             patch.object(ns, "LOG_FILE", ""), \
+             patch.object(ns, "_log_bucket_ts", None):
+            for tick in range(5):
+                with ns._writer_lock:
+                    ns._open_new_log(ns._log_bucket(1_700_000_000.0 + tick * 60))
+                    active = ns.LOG_FILE
+            ns.close_output_files()
+            remaining = sorted(str(p) for p in Path(self.dir).glob("*.csv"))
+        self.assertEqual(len(remaining), 2)
+        self.assertEqual(remaining[-1], active)
 
 
 # ---------------------------------------------------------------------------
