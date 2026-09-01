@@ -285,12 +285,28 @@ CLIENT_FRAME_TYPES = {
     "PROBE", "ASSOC_REQ", "REASSOC_REQ", "AUTH", "DEAUTH", "DISASSOC",
 }
 
-# Which frame types appear in the real-time terminal log. This affects the
-# terminal output only — every frame is still written to the CSV regardless.
-#   "all"       → print every tracked frame type
-#   "no-beacon" → print every frame except BEACON
-# Set from the --frames CLI flag in main().
-TERMINAL_FRAME_FILTER = "all"
+# Convenience names accepted by --hide alongside the individual subtype labels,
+# so the common cases stay short. Both sets are DERIVED, never written out: a
+# subtype added to MGMT_SUBTYPE_LABELS lands in the right group with no second
+# edit, and "client" is the same set that decides the [C]/[A] terminal tag, so
+# the two can never disagree.
+FRAME_TYPE_GROUPS: dict[str, frozenset[str]] = {
+    "beacon": frozenset({"BEACON"}),
+    "action": frozenset({"ACTION", "ACTION_NOACK"}),
+    "client": frozenset(CLIENT_FRAME_TYPES),
+    "ap":     frozenset(MGMT_SUBTYPE_LABELS.values()) - frozenset(CLIENT_FRAME_TYPES),
+}
+
+# Which frame types are suppressed in the real-time terminal log. This affects
+# terminal output ONLY — every frame is still fingerprinted, counted, written to
+# the CSV and shipped, regardless of what is hidden here.
+#
+# The --frames and --hide flags are both resolved into this one set at startup
+# by resolve_hidden_types(); nothing consults the raw flags at print time.
+# Carrying a mode string *and* a hide-set as two live pieces of filter state
+# would be two places to keep in step, and eventually one of them is forgotten.
+# Empty (the default) means every frame prints, as it always has.
+TERMINAL_HIDE_TYPES: frozenset[str] = frozenset()
 
 # ── Offline replay (--pcap) ──────────────────────────────────────────────────
 # Replay feeds a previously recorded pcap through the exact same handle_packet()
@@ -606,6 +622,54 @@ _log_bucket_ts: float | None = None
 def _log_bucket(now: float) -> float:
     """Return the start of the LOG_ROTATE_SECONDS interval containing ``now``."""
     return now - (now % LOG_ROTATE_SECONDS)
+
+
+def resolve_hidden_types(frames: str, hide: str | None) -> frozenset[str]:
+    """Resolve --frames and --hide into the single set of suppressed labels.
+
+    Both flags are statements about what to *suppress*, so the result is their
+    union: neither overrides the other, and `--frames no-beacon --hide action`
+    hides all three types.
+
+    Tokens are matched case-insensitively against the group names first and the
+    subtype labels second, with surrounding whitespace and empty tokens ignored.
+    An unrecognised name raises ValueError rather than being skipped — a typo
+    like ACTION_REQ (which does not exist; the labels are ACTION and
+    ACTION_NOACK) would otherwise leave the noise on screen with no explanation.
+    """
+    hidden: set[str] = set()
+
+    # --frames is kept as an alias for the two combinations that predate --hide.
+    if frames == "no-beacon":
+        hidden |= {"BEACON"}
+
+    valid_labels = {label.upper(): label for label in MGMT_SUBTYPE_LABELS.values()}
+
+    for token in (hide or "").split(","):
+        name = token.strip()
+        if not name:                       # tolerate "a,,b" and a trailing comma
+            continue
+        if name.lower() in FRAME_TYPE_GROUPS:
+            hidden |= FRAME_TYPE_GROUPS[name.lower()]
+        elif name.upper() in valid_labels:
+            hidden.add(valid_labels[name.upper()])
+        else:
+            raise ValueError(
+                f"unknown frame type or group: {name!r}\n"
+                f"  groups: {', '.join(sorted(FRAME_TYPE_GROUPS))}\n"
+                f"  types : {', '.join(sorted(valid_labels.values()))}"
+            )
+
+    return frozenset(hidden)
+
+
+def _describe_hidden_types() -> str:
+    """One-line, deterministic description of the terminal filter for startup."""
+    total = len(set(MGMT_SUBTYPE_LABELS.values()))
+    if not TERMINAL_HIDE_TYPES:
+        return f"showing all {total} frame types"
+    return (f"hiding {', '.join(sorted(TERMINAL_HIDE_TYPES))} "
+            f"({len(TERMINAL_HIDE_TYPES)} of {total})")
 
 
 def build_log_path(bucket_ts: float) -> str:
@@ -2022,9 +2086,9 @@ def _process_frame(pkt) -> None:
 
     # Print tracked frame types in real time. Client frames are tagged [C];
     # AP/other management frames (beacons today, anything new added to
-    # classify_frame() in future) are tagged [A]. The --frames flag can suppress
-    # BEACON frames from the terminal; CSV logging below is unaffected.
-    show_in_terminal = TERMINAL_FRAME_FILTER == "all" or pkt_type != "BEACON"
+    # classify_frame() in future) are tagged [A]. The --frames and --hide flags
+    # can suppress types from the terminal; CSV logging below is unaffected.
+    show_in_terminal = pkt_type not in TERMINAL_HIDE_TYPES
     if show_in_terminal:
         frame_tag = "[C]" if pkt_type in CLIENT_FRAME_TYPES else "[A]"
         try:
@@ -2278,7 +2342,7 @@ def run_replay(pcap_path: str, parser: argparse.ArgumentParser) -> None:
     log.info("Logging packets to              : %s", LOG_FILE)
     log.info("Logging IE breakdown to         : %s",
              IE_DETAILS_FILE if IE_REPORT_ENABLED else "off")
-    log.info("Terminal frame filter           : %s", TERMINAL_FRAME_FILTER)
+    log.info("Terminal frame filter           : %s", _describe_hidden_types())
     log.info("Raw frame bytes (Frame_Hex)     : %s",
              "on" if CAPTURE_RAW_FRAMES else "off")
 
@@ -2414,7 +2478,19 @@ def main() -> None:
         default="all",
         help="Which frame types to show in the real-time terminal log: "
              "'all' (default) shows every frame; 'no-beacon' hides BEACON "
-             "frames. Does not affect CSV logging.",
+             "frames. Kept as a shorthand for --hide; the two combine. "
+             "Does not affect CSV logging.",
+    )
+    parser.add_argument(
+        "--hide",
+        default=None,
+        metavar="TYPES",
+        help="Comma-separated frame types to suppress from the real-time "
+             "terminal log, e.g. --hide beacon,action. Groups: "
+             f"{', '.join(sorted(FRAME_TYPE_GROUPS))}. Types: "
+             f"{', '.join(sorted(set(MGMT_SUBTYPE_LABELS.values())))}. "
+             "Names are case-insensitive. Terminal output only: hidden frames "
+             "are still fingerprinted, counted, written to the CSV and shipped.",
     )
     parser.add_argument(
         "--ship",
@@ -2438,9 +2514,19 @@ def main() -> None:
     if args.hop and args.mode == "camp":
         parser.error("--hop contradicts --mode camp; pass only one of them.")
 
-    global TERMINAL_FRAME_FILTER, CAPTURE_RAW_FRAMES, IE_REPORT_ENABLED
+    global TERMINAL_HIDE_TYPES, CAPTURE_RAW_FRAMES, IE_REPORT_ENABLED
     global LOG_PRUNE_ENABLED
-    TERMINAL_FRAME_FILTER = args.frames
+    try:
+        TERMINAL_HIDE_TYPES = resolve_hidden_types(args.frames, args.hide)
+    except ValueError as exc:
+        # Fail before the radio is touched. A typo that only warned would scroll
+        # past and leave the run showing traffic the operator thought was hidden.
+        parser.error(f"--hide: {exc}")
+    if len(TERMINAL_HIDE_TYPES) >= len(set(MGMT_SUBTYPE_LABELS.values())):
+        # A legitimate quiet mode, but a silent terminal must never be mistaken
+        # for a dead capture.
+        log.warning("Terminal output suppressed for all %d frame types; "
+                    "CSV logging is unaffected.", len(TERMINAL_HIDE_TYPES))
     CAPTURE_RAW_FRAMES    = args.raw_frames == "on"
     IE_REPORT_ENABLED     = args.ie_report == "on"
     LOG_PRUNE_ENABLED     = args.prune == "on"
@@ -2531,7 +2617,7 @@ def main() -> None:
     log.info("Logging IE breakdown to       : %s",
              IE_DETAILS_FILE if IE_REPORT_ENABLED else "off")
     log.info("Max reconnect attempts        : %d", MAX_RETRIES)
-    log.info("Terminal frame filter         : %s", TERMINAL_FRAME_FILTER)
+    log.info("Terminal frame filter         : %s", _describe_hidden_types())
     log.info("Raw frame bytes (Frame_Hex)   : %s",
              "on" if CAPTURE_RAW_FRAMES else "off")
     log.info("Capture mode                  : %s", mode)

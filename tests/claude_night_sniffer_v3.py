@@ -12,8 +12,10 @@ run directly with:
     PYTHONPATH=src python -m unittest tests/claude_night_sniffer_v3.py
 """
 
+import contextlib
 import csv
 import importlib
+import io
 import time
 import sys
 import types
@@ -1115,6 +1117,151 @@ class PromptDefaultsTests(unittest.TestCase):
     def test_configured_defaults_are_valid_choices(self):
         self.assertIn(ns.DEFAULT_CAPTURE_MODE, ns.CAPTURE_MODES)
         self.assertIn(ns.DEFAULT_BAND, ns.BANDS)
+
+
+# ---------------------------------------------------------------------------
+# Terminal output filtering (--frames / --hide)
+# ---------------------------------------------------------------------------
+
+class GatedPacket(WirePacket):
+    """WirePacket that also answers the frame-control and SC interfaces.
+
+    _process_frame() reads the sequence-control field through ``pkt[Dot11]``
+    and the type/subtype through ``getlayer(Dot11)``, so a packet driven all
+    the way through handle_packet() has to satisfy both.
+    """
+
+    def __init__(self, subtype, addr2):
+        super().__init__(subtype=subtype, addr2=addr2)
+        self.type    = 0
+        self.subtype = subtype
+        self.addr1   = "ff:ff:ff:ff:ff:ff"
+        self.SC      = 0
+
+    def __getitem__(self, layer):
+        return self
+
+    def getlayer(self, layer, ID=None):
+        return self if layer is ns.Dot11 else None
+
+    @property
+    def original(self):
+        return self._raw
+
+
+class ResolveHiddenTypesTests(unittest.TestCase):
+    """--frames and --hide resolve to one set of suppressed labels."""
+
+    def test_default_hides_nothing(self):
+        self.assertEqual(ns.resolve_hidden_types("all", None), frozenset())
+        self.assertEqual(ns.resolve_hidden_types("all", ""), frozenset())
+
+    def test_no_beacon_alias_still_works(self):
+        # Kept for the runbooks and existing muscle memory.
+        self.assertEqual(ns.resolve_hidden_types("no-beacon", None),
+                         frozenset({"BEACON"}))
+
+    def test_action_group_covers_both_action_subtypes(self):
+        # The reason the group exists: there is no ACTION_REQ, and hiding only
+        # ACTION leaves ACTION_NOACK on screen.
+        self.assertEqual(ns.resolve_hidden_types("all", "action"),
+                         frozenset({"ACTION", "ACTION_NOACK"}))
+
+    def test_flags_combine_as_a_union(self):
+        # Both flags say "suppress", so neither overrides the other.
+        self.assertEqual(ns.resolve_hidden_types("no-beacon", "action"),
+                         frozenset({"BEACON", "ACTION", "ACTION_NOACK"}))
+
+    def test_names_are_case_insensitive_and_whitespace_tolerant(self):
+        self.assertEqual(ns.resolve_hidden_types("all", " beacon , ACTION ,,"),
+                         frozenset({"BEACON", "ACTION", "ACTION_NOACK"}))
+        self.assertEqual(ns.resolve_hidden_types("all", "Beacon"),
+                         ns.resolve_hidden_types("all", "BEACON"))
+
+    def test_explicit_labels_work_alongside_groups(self):
+        self.assertEqual(ns.resolve_hidden_types("all", "PROBE_RESP,beacon"),
+                         frozenset({"PROBE_RESP", "BEACON"}))
+
+    def test_unknown_name_raises_rather_than_being_ignored(self):
+        # A typo that only warned would scroll past and leave the operator
+        # watching traffic they believed was hidden.
+        with self.assertRaises(ValueError) as caught:
+            ns.resolve_hidden_types("all", "ACTION_REQ")
+        self.assertIn("ACTION_REQ", str(caught.exception))
+
+    def test_client_and_ap_groups_partition_every_label(self):
+        # Both are derived, not written out, so a subtype added to
+        # MGMT_SUBTYPE_LABELS lands in exactly one of them with no second edit.
+        client = ns.FRAME_TYPE_GROUPS["client"]
+        ap     = ns.FRAME_TYPE_GROUPS["ap"]
+        labels = frozenset(ns.MGMT_SUBTYPE_LABELS.values())
+        self.assertEqual(client, frozenset(ns.CLIENT_FRAME_TYPES))
+        self.assertEqual(client | ap, labels)
+        self.assertEqual(client & ap, frozenset())
+
+    def test_hiding_every_group_is_expressible(self):
+        # The quiet mode main() warns about: CSV only, empty terminal.
+        self.assertEqual(ns.resolve_hidden_types("all", "client,ap"),
+                         frozenset(ns.MGMT_SUBTYPE_LABELS.values()))
+
+
+class TerminalHideGateTests(unittest.TestCase):
+    """The filter suppresses printing and nothing else."""
+
+    def _run(self, hidden, subtypes):
+        """Drive handle_packet() and return (csv_rows, printed_lines)."""
+        rows: list = []
+        buffer = io.StringIO()
+        with patch.object(ns, "_append_csv_row", rows.append), \
+             patch.object(ns, "TERMINAL_HIDE_TYPES", frozenset(hidden)), \
+             contextlib.redirect_stdout(buffer):
+            for index, subtype in enumerate(subtypes):
+                ns.handle_packet(GatedPacket(subtype, f"aa:bb:cc:dd:ee:{index:02x}"))
+        printed = [line for line in buffer.getvalue().splitlines() if line.strip()]
+        return rows, printed
+
+    def test_hidden_frames_still_reach_the_csv(self):
+        # The whole safety property of this feature: --hide is a display
+        # filter. Capture, fingerprinting and logging must not notice it.
+        rows, printed = self._run({"BEACON"}, [8, 4, 13])   # BEACON, PROBE, ACTION
+        self.assertEqual(len(rows), 3)
+        self.assertEqual(len(printed), 2)
+        self.assertNotIn("BEACON", "".join(printed))
+        self.assertIn("PROBE", "".join(printed))
+        self.assertIn("ACTION", "".join(printed))
+
+    def test_empty_filter_prints_everything(self):
+        rows, printed = self._run(set(), [8, 4, 13])
+        self.assertEqual(len(rows), 3)
+        self.assertEqual(len(printed), 3)
+
+    def test_hiding_every_type_still_logs_every_row(self):
+        rows, printed = self._run(ns.MGMT_SUBTYPE_LABELS.values(), [8, 4, 13])
+        self.assertEqual(len(rows), 3)
+        self.assertEqual(printed, [])
+
+    def test_action_group_silences_both_action_subtypes(self):
+        hidden = ns.resolve_hidden_types("all", "action")
+        rows, printed = self._run(hidden, [13, 14, 4])   # ACTION, NOACK, PROBE
+        self.assertEqual(len(rows), 3)
+        self.assertEqual(len(printed), 1)
+        self.assertIn("PROBE", printed[0])
+
+
+class DescribeHiddenTypesTests(unittest.TestCase):
+    """The startup line reports the resolved set, not the raw flag."""
+
+    def test_empty_filter_says_so(self):
+        with patch.object(ns, "TERMINAL_HIDE_TYPES", frozenset()):
+            self.assertEqual(ns._describe_hidden_types(),
+                             "showing all 16 frame types")
+
+    def test_hidden_types_are_listed_sorted(self):
+        # Sorted so two runs with the same filter produce identical lines.
+        with patch.object(ns, "TERMINAL_HIDE_TYPES",
+                          frozenset({"BEACON", "ACTION", "ACTION_NOACK"})):
+            self.assertEqual(ns._describe_hidden_types(),
+                             "hiding ACTION, ACTION_NOACK, BEACON (3 of 16)")
 
 
 if __name__ == "__main__":

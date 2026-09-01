@@ -1678,3 +1678,102 @@ sitting as the TASK 4 runbook.
 - No regression test was added for the reset, since the spec did not ask for one
   and the scope rule is to change only what was asked. The driver used above
   could become a permanent test cheaply — say the word.
+
+---
+
+## 2026-09-01 14:12 Per-type terminal output filter (`--hide`)
+
+Design agreed in conversation, written up first at
+`explanation/20260901-1353-terminal-hide-filter-design.md`. Files touched:
+`src/night_sniffer_v3.py`, `tests/claude_night_sniffer_v3.py`.
+
+Decisions taken with Pla2 before building: `--hide` only (no `--show`);
+`--frames all|no-beacon` kept as an alias; no interactive checkbox for now.
+
+### What it does
+
+```
+--hide BEACON,ACTION,ACTION_NOACK      # explicit labels
+--hide beacon,action                    # same, via groups
+```
+
+Default empty — every frame prints, as before. Terminal output only: hidden
+frames are still classified, fingerprinted, counted, written to the CSV and
+shipped.
+
+Worth recording because it caused the original confusion: **there is no
+`ACTION_REQ`.** The two action subtypes are `ACTION` (13) and `ACTION_NOACK`
+(14), which is exactly why the `action` group exists.
+
+### Design
+
+`TERMINAL_FRAME_FILTER` (a mode string) is gone, replaced by
+`TERMINAL_HIDE_TYPES: frozenset[str]`. `--frames` and `--hide` are resolved into
+that one set at startup by `resolve_hidden_types()`; nothing reads the raw flags
+at print time. Two live pieces of filter state would have been two places to
+keep in step — the same shape as this morning's retry-counter bug. The gate is
+now one set lookup:
+
+```python
+show_in_terminal = pkt_type not in TERMINAL_HIDE_TYPES
+```
+
+`FRAME_TYPE_GROUPS` — `beacon`, `action`, `client`, `ap`. `client` refers to the
+existing `CLIENT_FRAME_TYPES`, so the group and the `[C]`/`[A]` terminal tag can
+never disagree; `ap` is computed as its complement over
+`MGMT_SUBTYPE_LABELS.values()`. A subtype added to that table lands in the right
+group with no second edit.
+
+Rules, as agreed:
+
+- **Union, not override.** `--frames no-beacon --hide action` hides all three.
+- **An unknown name is a hard error** — `parser.error`, exit 2, before the radio
+  is touched. A warning would scroll past and leave the run showing traffic the
+  operator believed was hidden.
+- **Hiding everything is allowed** (`--hide client,ap`, a CSV-only quiet mode)
+  but warns once at startup, so a silent terminal is never read as a dead
+  capture.
+
+The startup line now reports the resolved set, sorted, rather than the raw flag:
+`hiding ACTION, ACTION_NOACK, BEACON (3 of 16)`.
+
+### Verification
+
+Replay of `20260824-1357-dumpcap-rpi6-pre-ship.pcap`, 3163 frames:
+
+```
+hide=<none>         printed=3163   csv_rows=3163
+hide=beacon         printed=1346   csv_rows=3163
+hide=beacon,action  printed=271    csv_rows=3163
+hide=client,ap      printed=0      csv_rows=3163
+```
+
+**The CSV row count does not move.** That is the entire safety property of this
+change, and it is the number to re-check if the filter is ever extended.
+
+`--hide ACTION_REQ` exits 2 with the valid group and type lists printed. The
+quiet-mode warning fires at `client,ap`. The startup line renders as designed
+for both cases.
+
+Tests: `Ran 178 tests … OK` (was 163). Three new classes in
+`tests/claude_night_sniffer_v3.py` — `ResolveHiddenTypesTests` (9),
+`TerminalHideGateTests` (4), `DescribeHiddenTypesTests` (2). Nothing in the
+suite referenced the terminal filter before, so this is new coverage rather than
+a repair. The gate tests drive `handle_packet()` end to end and assert the CSV
+row count against the printed line count, which is the replay check expressed as
+a unit test.
+
+Not touched: `classify_frame()`, `CLIENT_FRAME_TYPES` membership, the `[C]`/`[A]`
+tag, the colour picker, the CSV write path, shipping.
+
+### Outstanding
+
+One live run on the Pi with `--hide beacon,action` against real traffic. Can
+join the TASK 4 runbook sitting.
+
+### Deliberately not in this task
+
+Toggling the filter mid-run with a keypress — the version where combining a
+specific view stops being painful. Needs a stdin reader thread sharing the
+terminal with the print loop; own task. `--show` remains additive later without
+breaking anything built here.
