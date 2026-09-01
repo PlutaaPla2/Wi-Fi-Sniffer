@@ -1150,43 +1150,43 @@ class GatedPacket(WirePacket):
 
 
 class ResolveHiddenTypesTests(unittest.TestCase):
-    """--frames and --hide resolve to one set of suppressed labels."""
+    """--hide resolves to the set of suppressed labels."""
 
     def test_default_hides_nothing(self):
-        self.assertEqual(ns.resolve_hidden_types("all", None), frozenset())
-        self.assertEqual(ns.resolve_hidden_types("all", ""), frozenset())
+        self.assertEqual(ns.resolve_hidden_types(None), frozenset())
+        self.assertEqual(ns.resolve_hidden_types(""), frozenset())
 
-    def test_no_beacon_alias_still_works(self):
-        # Kept for the runbooks and existing muscle memory.
-        self.assertEqual(ns.resolve_hidden_types("no-beacon", None),
+    def test_beacon_replaces_the_old_no_beacon_mode(self):
+        # --frames no-beacon was the only filter before --hide existed; this is
+        # the same behaviour spelled with the flag that replaced it.
+        self.assertEqual(ns.resolve_hidden_types("BEACON"),
                          frozenset({"BEACON"}))
 
     def test_action_group_covers_both_action_subtypes(self):
         # The reason the group exists: there is no ACTION_REQ, and hiding only
         # ACTION leaves ACTION_NOACK on screen.
-        self.assertEqual(ns.resolve_hidden_types("all", "action"),
+        self.assertEqual(ns.resolve_hidden_types("action"),
                          frozenset({"ACTION", "ACTION_NOACK"}))
 
-    def test_flags_combine_as_a_union(self):
-        # Both flags say "suppress", so neither overrides the other.
-        self.assertEqual(ns.resolve_hidden_types("no-beacon", "action"),
+    def test_groups_and_labels_accumulate(self):
+        self.assertEqual(ns.resolve_hidden_types("BEACON,action"),
                          frozenset({"BEACON", "ACTION", "ACTION_NOACK"}))
 
     def test_names_are_case_insensitive_and_whitespace_tolerant(self):
-        self.assertEqual(ns.resolve_hidden_types("all", " beacon , ACTION ,,"),
+        self.assertEqual(ns.resolve_hidden_types(" beacon , ACTION ,,"),
                          frozenset({"BEACON", "ACTION", "ACTION_NOACK"}))
-        self.assertEqual(ns.resolve_hidden_types("all", "Beacon"),
-                         ns.resolve_hidden_types("all", "BEACON"))
+        self.assertEqual(ns.resolve_hidden_types("Beacon"),
+                         ns.resolve_hidden_types("BEACON"))
 
     def test_explicit_labels_work_alongside_groups(self):
-        self.assertEqual(ns.resolve_hidden_types("all", "PROBE_RESP,beacon"),
+        self.assertEqual(ns.resolve_hidden_types("PROBE_RESP,beacon"),
                          frozenset({"PROBE_RESP", "BEACON"}))
 
     def test_unknown_name_raises_rather_than_being_ignored(self):
         # A typo that only warned would scroll past and leave the operator
         # watching traffic they believed was hidden.
         with self.assertRaises(ValueError) as caught:
-            ns.resolve_hidden_types("all", "ACTION_REQ")
+            ns.resolve_hidden_types("ACTION_REQ")
         self.assertIn("ACTION_REQ", str(caught.exception))
 
     def test_client_and_ap_groups_partition_every_label(self):
@@ -1201,7 +1201,7 @@ class ResolveHiddenTypesTests(unittest.TestCase):
 
     def test_hiding_every_group_is_expressible(self):
         # The quiet mode main() warns about: CSV only, empty terminal.
-        self.assertEqual(ns.resolve_hidden_types("all", "client,ap"),
+        self.assertEqual(ns.resolve_hidden_types("client,ap"),
                          frozenset(ns.MGMT_SUBTYPE_LABELS.values()))
 
 
@@ -1241,7 +1241,7 @@ class TerminalHideGateTests(unittest.TestCase):
         self.assertEqual(printed, [])
 
     def test_action_group_silences_both_action_subtypes(self):
-        hidden = ns.resolve_hidden_types("all", "action")
+        hidden = ns.resolve_hidden_types("action")
         rows, printed = self._run(hidden, [13, 14, 4])   # ACTION, NOACK, PROBE
         self.assertEqual(len(rows), 3)
         self.assertEqual(len(printed), 1)

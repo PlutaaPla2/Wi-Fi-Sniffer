@@ -1777,3 +1777,55 @@ Toggling the filter mid-run with a keypress — the version where combining a
 specific view stops being painful. Needs a stdin reader thread sharing the
 terminal with the print loop; own task. `--show` remains additive later without
 breaking anything built here.
+
+---
+
+## 2026-09-01 14:41 Removed `--frames` (superseded by `--hide`)
+
+Follow-up to the 14:12 entry, on Pla2's instruction once `--hide` was pushed
+(`f5e89ee`). Files touched: `src/night_sniffer_v3.py`,
+`tests/claude_night_sniffer_v3.py`, plus two runbook command lines.
+
+### Removed
+
+- The `--frames {all,no-beacon}` argument.
+- `resolve_hidden_types()`'s `frames` parameter and its alias branch. Signature
+  is now `resolve_hidden_types(hide: str | None)`.
+- The comments describing the two flags combining, which no longer describe
+  anything.
+
+`--hide BEACON` is what `--frames no-beacon` was; the default (nothing hidden)
+is what `--frames all` was. No capability was lost.
+
+`--frames` is now rejected: `error: unrecognized arguments: --frames no-beacon`,
+exit 2. That is the right failure — a silently ignored flag would leave beacons
+scrolling past on a run the operator thought was filtered.
+
+### Tests
+
+`Ran 178 tests … OK`, unchanged in count. `test_no_beacon_alias_still_works`
+became `test_beacon_replaces_the_old_no_beacon_mode` and
+`test_flags_combine_as_a_union` became `test_groups_and_labels_accumulate`;
+both kept their assertions, retargeted at the surviving flag. The remaining
+calls dropped their first argument.
+
+### Callers corrected
+
+Two live procedures used the removed flag and would have failed at their first
+command:
+
+- `prompts/RUNBOOK_TASK4_pi_rotation_test.md:39` (Test A)
+- `explanation/20260901-1133-hotfix-retry-counter-reset.md:152` (the Pi retry test)
+
+Both now read `--hide BEACON`. Historical `prompts/TASK_*.md` specs and older
+`explanation/` reports still mention `--frames`; those are records of what was
+true when written and were left alone.
+
+### Verified
+
+Replay unchanged: `--hide beacon,action` gives `printed=271 csv_rows=3163`, the
+same numbers as before the removal.
+
+### Not done, deferred by Pla2
+
+`--show` and the interactive checkbox prompt. Both remain additive later.

@@ -301,10 +301,9 @@ FRAME_TYPE_GROUPS: dict[str, frozenset[str]] = {
 # terminal output ONLY — every frame is still fingerprinted, counted, written to
 # the CSV and shipped, regardless of what is hidden here.
 #
-# The --frames and --hide flags are both resolved into this one set at startup
-# by resolve_hidden_types(); nothing consults the raw flags at print time.
-# Carrying a mode string *and* a hide-set as two live pieces of filter state
-# would be two places to keep in step, and eventually one of them is forgotten.
+# Set from the --hide CLI flag in main(), via resolve_hidden_types(); nothing
+# consults the raw flag at print time, so there is exactly one piece of filter
+# state to keep correct.
 # Empty (the default) means every frame prints, as it always has.
 TERMINAL_HIDE_TYPES: frozenset[str] = frozenset()
 
@@ -624,24 +623,19 @@ def _log_bucket(now: float) -> float:
     return now - (now % LOG_ROTATE_SECONDS)
 
 
-def resolve_hidden_types(frames: str, hide: str | None) -> frozenset[str]:
-    """Resolve --frames and --hide into the single set of suppressed labels.
-
-    Both flags are statements about what to *suppress*, so the result is their
-    union: neither overrides the other, and `--frames no-beacon --hide action`
-    hides all three types.
+def resolve_hidden_types(hide: str | None) -> frozenset[str]:
+    """Resolve --hide into the set of frame-type labels the terminal suppresses.
 
     Tokens are matched case-insensitively against the group names first and the
     subtype labels second, with surrounding whitespace and empty tokens ignored.
     An unrecognised name raises ValueError rather than being skipped — a typo
     like ACTION_REQ (which does not exist; the labels are ACTION and
     ACTION_NOACK) would otherwise leave the noise on screen with no explanation.
+
+    Superseded --frames, which offered only "all" and "no-beacon";
+    `--hide BEACON` is the latter and the default is the former.
     """
     hidden: set[str] = set()
-
-    # --frames is kept as an alias for the two combinations that predate --hide.
-    if frames == "no-beacon":
-        hidden |= {"BEACON"}
 
     valid_labels = {label.upper(): label for label in MGMT_SUBTYPE_LABELS.values()}
 
@@ -2086,8 +2080,8 @@ def _process_frame(pkt) -> None:
 
     # Print tracked frame types in real time. Client frames are tagged [C];
     # AP/other management frames (beacons today, anything new added to
-    # classify_frame() in future) are tagged [A]. The --frames and --hide flags
-    # can suppress types from the terminal; CSV logging below is unaffected.
+    # classify_frame() in future) are tagged [A]. The --hide flag can suppress
+    # types from the terminal; CSV logging below is unaffected.
     show_in_terminal = pkt_type not in TERMINAL_HIDE_TYPES
     if show_in_terminal:
         frame_tag = "[C]" if pkt_type in CLIENT_FRAME_TYPES else "[A]"
@@ -2473,15 +2467,6 @@ def main() -> None:
              "configured defaults. Created if missing; filenames are unchanged.",
     )
     parser.add_argument(
-        "--frames",
-        choices=["all", "no-beacon"],
-        default="all",
-        help="Which frame types to show in the real-time terminal log: "
-             "'all' (default) shows every frame; 'no-beacon' hides BEACON "
-             "frames. Kept as a shorthand for --hide; the two combine. "
-             "Does not affect CSV logging.",
-    )
-    parser.add_argument(
         "--hide",
         default=None,
         metavar="TYPES",
@@ -2517,7 +2502,7 @@ def main() -> None:
     global TERMINAL_HIDE_TYPES, CAPTURE_RAW_FRAMES, IE_REPORT_ENABLED
     global LOG_PRUNE_ENABLED
     try:
-        TERMINAL_HIDE_TYPES = resolve_hidden_types(args.frames, args.hide)
+        TERMINAL_HIDE_TYPES = resolve_hidden_types(args.hide)
     except ValueError as exc:
         # Fail before the radio is touched. A typo that only warned would scroll
         # past and leave the run showing traffic the operator thought was hidden.
