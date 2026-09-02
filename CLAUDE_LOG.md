@@ -1829,3 +1829,230 @@ same numbers as before the removal.
 ### Not done, deferred by Pla2
 
 `--show` and the interactive checkbox prompt. Both remain additive later.
+
+## 2026-09-01 16:29 Completeness review of the two live files
+
+Read-only review at Pla2's request, scoped to `src/night_sniffer_v3.py` and
+`src/ship_logstash.py`. No code changed.
+
+Baseline confirmed first: 178 tests locally, 184 under the CI discover pattern,
+and every `ci.yml` step reproduces green on this machine.
+
+Nine gaps found, ranked. The top three:
+
+1. Output paths are CWD-relative (`:81`, `:86`, `:87`) with no `__file__`
+   anywhere in either file — against CLAUDE.md's own convention. Ranked first
+   because `_prune_old_logs()` globs `LOG_DIR`, so the deleting code follows
+   the same wrong directory when launched from elsewhere on the shared Pi.
+2. `ship_logstash.py` has zero test coverage — half the live surface.
+3. Nothing reports what actually reached Logstash; `ship_stats()` counts
+   queued events only, and only at shutdown.
+
+Also: no timestamps in the log format (`:466`), `reset_monitor_mode()` still
+does not verify recovery, CLAUDE.md/README describe neither live file
+accurately (Lint/Test are literal `...`, `ship_logstash.py` unlisted), and CI
+smoke-tests `test_sniffer_v0_7.py --help` rather than the live CLI.
+
+Full report: `explanation/20260901-1629-completeness-review.md`.
+
+## 2026-09-01 17:05 TASK 5 — removed the per-IE breakdown report
+
+Deletion-only, per `prompts/TASK_5_remove_ie_report.md`. `ie_details_report.csv`
+and everything that existed solely to produce it are gone.
+
+### Line counts
+
+| File | Before | After | Delta |
+|---|---:|---:|---:|
+| `src/night_sniffer_v3.py` | 2736 | 2494 | **-242** |
+| `tests/claude_night_sniffer_v3.py` | 1268 | 1179 | -89 |
+| `tests/test_night_sniffer_v3.py` | 673 | 615 | -58 |
+| **Total** | 4677 | 4288 | **-389** |
+
+The spec predicted 2498 for the source; actual is 2494, four lines lower. Three
+come from the docstring rewrites in 5.2 and 5.5 being more compact than the
+spec's wording assumed, one from collapsing a triple blank line left where the
+`dump_ie_details()` call was removed at the end of `_process_frame()`. No
+symbol beyond the listed set was touched.
+
+### Symbols removed
+
+`IE_DETAILS_FILE`, `IE_REPORT_ENABLED`, `IE_CSV_FIELDS`, `IE_NAMES` (28
+entries), `PSEUDO_IE_FIXED`, `PSEUDO_IE_UNPARSED`, `ACTION_CATEGORY_NAMES` (24
+entries), `setup_ie_csv()`, `_decode_ie()`, `_decode_fixed()`,
+`dump_ie_details()`, and the `--ie-report` CLI flag.
+
+Untouched, as required: `_walk_tlvs`, `FrameParts`, `_split_action_body`,
+`_frame_parts`, `_iter_ies`, `extract_ie_details`, `MGMT_FIXED_BODY_LEN`,
+`ACTION_ELEMENT_OFFSETS`, `lookup_oui`, `_writer_for` / `_close_writer` /
+`close_output_files`, `VOLATILE_IE_IDS`. `FINGERPRINT_VERSION` stays at 2 — the
+SHA-1 input did not change.
+
+### Preconditions
+
+Tree clean apart from `CLAUDE_LOG.md`; source at the expected 2736 lines. All
+five symbols confirmed leaves. `_writer_for` count 3 as expected.
+`lookup_oui` counted **5, not the expected 4** — the fifth was inside
+`_decode_ie()`, which this task deletes, so it reads 4 afterwards. The check's
+intent (non-report consumers survive) held.
+
+### V1 — static
+
+```
+ast: ok
+wc -l  ->  2494
+grep IE_DETAILS|IE_REPORT|IE_CSV|IE_NAMES|PSEUDO_IE|ACTION_CATEGORY|
+     _decode_ie|_decode_fixed|dump_ie_details|setup_ie_csv|ie.report
+  ->  (no output, exit 1)
+--help  ->  succeeds, --ie-report absent
+```
+
+### V2 — fingerprint parity (the load-bearing check)
+
+Baseline captured before any edit, from
+`pcap_files/20260824-1357-dumpcap-rpi6-pre-ship.pcap` (`.pcap`, not the
+`.pcapng` the spec names — it is the only capture file present).
+
+```
+diff <(cat ie_before/*-wifi_full_recon_report.csv) \
+     <(cat ie_after/*-wifi_full_recon_report.csv)
+<no output>   rc=0
+
+881e4d2ba92102237a129ea2c71d8976  ie_before/...-wifi_full_recon_report.csv
+881e4d2ba92102237a129ea2c71d8976  ie_after/...-wifi_full_recon_report.csv
+```
+
+Byte-identical, same md5. `IE_Fingerprint`, `IE_Sequence`, `Vendor_IEs`,
+`Capabilities` and `Frame_Hex` all unchanged. No `ie_details_report.csv` in the
+after directory. Logstash shipping is unaffected by construction: `ship_row()`
+zips against `CSV_FIELDS`, which this task does not edit, and the deleted call
+ran strictly after both `_append_csv_row()` and `ship_row()`.
+
+### Tests
+
+Not covered by the spec, but required — CI runs `unittest discover` and 19
+tests errored on the removed symbols.
+
+Deleted (tested deleted behaviour): `DecodeIeTests` (8),
+`DumpIeDetailsTests` (2), the two `setup_ie_csv` tests,
+`test_ie_report_rows_reconstruct_the_body`,
+`test_truncating_the_ie_report_drops_the_cached_handle`.
+
+Adapted, assertions preserved: the two `_process_frame` tests lost only their
+`dump_ie_details` patch clause; `NightSnifferV3WriterTests` setUp/tearDown now
+save `LOG_FILE` alone; `NightSnifferV3OutputDirTests` checks two outputs
+instead of three and its test is renamed `test_redirects_both_outputs`, the
+basename half of the old name having been the IE assertion.
+
+184 -> 170 under the CI discover pattern (164 for the two named modules), all
+green. Every CI step reproduces locally: compileall, discover, `bash -n`, CLI
+smoke.
+
+### Skipped
+
+V3, the live RPi capture — no radio on this machine, and V2 is the
+load-bearing check. Pla2 can run it at the sensor; the startup banner no longer
+carries a "Logging IE breakdown to" line.
+
+### Suggestions / Issues noticed
+
+- **`scripts/mgmt_parity.py:302` calls `ns.IE_NAMES` and now raises
+  `AttributeError`.** The spec's leaf grep was scoped to `night_sniffer_v3.py`
+  so it could not see this. Left untouched per scope lockout. Nothing in CI
+  runs it (`compileall` covers `src archive tests`, not `scripts/`), so no
+  build goes red. It was the in-repo way to do a per-IE comparison; that job is
+  now tshark or Wireshark against the pcap.
+- The spec's claim that the deleted rows stay "reconstructable offline from
+  `Frame_Hex` via `--pcap` replay" is not accurate after the removal — the code
+  that emits them is gone, so replay will not regenerate them either. What is
+  preserved is the bytes (`Frame_Hex` when `--raw-frames on`, and the pcaps).
+  Confirmed acceptable by Pla2 for past captures taken with `--raw-frames off`.
+- `IE_NAMES` still exists independently in `src/config.py`,
+  `src/wifi_sniffer.py` and `src/test_sniffer_v0_7.py`. Unrelated definitions in
+  the unused older code; not touched.
+
+---
+
+## 2026-09-02 02:59 KNOWN_OUIS audit (read-only, no code changed)
+
+Pla2 asked me to verify the 21 entries in `KNOWN_OUIS`
+(`src/night_sniffer_v3.py:394`) and cite sources. Checked every key by exact
+match against the IEEE MA-L/MA-M/MA-S registries downloaded today
+(`oui.csv` md5 7a68ff499f656abe063be2f5a8f11e5f, 40050 lines;
+`mam.csv` a5120bdab6834a462ce006b94ad6fdf9; `oui36.csv`
+46f544fbd86c9e620c70b62959b62c49).
+
+**15 correct, 6 wrong:**
+
+| Key | Label in code | IEEE |
+|---|---|---|
+| `f8:a4:5f` | Oppo Mobile | Xiaomi Communications Co Ltd |
+| `d4:f5:13` | Vivo Mobile | Texas Instruments |
+| `00:23:45` | Foxconn | Sony Corporation |
+| `4c:ed:de` | AzureWave | ASKEY COMPUTER CORP |
+| `44:fb:42` | Tesla, Inc. | Apple, Inc. |
+| `84:e1:ba` | Tuya Smart | unassigned in all three registries |
+
+Impact: `vendor_from_ie_ouis()` (:726) consults KNOWN_OUIS *before*
+`mac_vendor_lookup`, so a wrong entry overrides a correct database answer
+rather than merely failing to resolve.
+
+No edit made — the task was verification only. IEEE-verified replacement
+candidates and the full method are in
+`explanation/20260902-0259-known-ouis-audit.md`.
+
+### Suggestions / Issues noticed
+
+- These vendors hold tens to hundreds of MA-L blocks each (Apple: 1553), so a
+  21-entry hand-curated dict resolves very little real traffic, and client
+  probes mostly carry randomized locally-administered MACs anyway. Its only
+  real job is overriding `mac_vendor_lookup`, which is exactly why every entry
+  in it needs to be certain.
+
+---
+
+## 2026-09-02 03:15 KNOWN_OUIS — relabelled six keys, appended six verified blocks
+
+Follow-up to the audit above. Pla2's instruction: correct the labels on the
+existing keys without changing those keys, then append the six IEEE-verified
+blocks after `44:fb:42`.
+
+**Relabelled in place** (keys untouched, labels now name the registry's actual
+assignee):
+
+| Key | Was | Now |
+|---|---|---|
+| `f8:a4:5f` | Oppo Mobile | Xiaomi Communications |
+| `d4:f5:13` | Vivo Mobile | Texas Instruments |
+| `00:23:45` | Foxconn | Sony Corporation |
+| `4c:ed:de` | AzureWave (IoT/Laptop) | Askey Computer |
+| `84:e1:ba` | Tuya Smart (IoT) | Unassigned (IEEE) |
+| `44:fb:42` | Tesla, Inc. | Apple, Inc. |
+
+**Appended after `44:fb:42`**, under a comment recording the verification date:
+`e4:40:97` Oppo Mobile, `64:ec:65` Vivo Mobile, `58:10:31` Foxconn,
+`50:fe:0c` AzureWave (IoT/Laptop), `98:ed:5c` Tesla, Inc.,
+`1c:90:ff` Tuya Smart (IoT). Dict is 21 -> 27 entries; file 2494 -> 2503 lines.
+
+**One test adapted.** `test_iot_vendor_from_mac_oui_alone`
+(`tests/claude_night_sniffer_v3.py:477`) asserted `84:E1:BA` classifies as
+`Smart Home/IoT (Tuya Smart (IoT))`. That OUI is no longer labelled Tuya, so the
+fixture MAC now uses the real Tuya block `1C:90:FF`. The assertion is unchanged
+— the classifier at :1263 still matches on `"Tuya Smart" in vendor`, and the
+test still covers what it was written to cover: vendor identified from the MAC
+OUI alone, with no information elements.
+
+Verification: `ast` ok; 170 tests OK (`PYTHONPATH=src ... discover -s tests`);
+`compileall src archive tests` ok; `--help` ok.
+
+### Suggestions / Issues noticed
+
+- `84:e1:ba` is now labelled `Unassigned (IEEE)`, kept per instruction. Note the
+  vendor-IE path at :1251 accepts any label without `"Unknown"` in it, so if
+  that OUI ever shows up in a tag-221 element the recon report will print
+  `Unassigned (IEEE)` as a vendor. Deleting the key, or renaming the label to
+  contain `Unknown`, would both avoid that — say which and I'll do it.
+- The six original keys are still in the dict, now pointing at their true
+  vendors. That is more coverage, not less, but it does mean e.g. Xiaomi has two
+  entries and Apple two — harmless for a lookup dict, just worth knowing when
+  reading it.

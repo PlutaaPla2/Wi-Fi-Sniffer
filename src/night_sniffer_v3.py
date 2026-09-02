@@ -78,7 +78,6 @@ LOG_KEEP_FILES     = 2
 LOG_PRUNE_ENABLED  = False
 
 LOG_FILE           = ""                        # active file; set by init_log_file()
-IE_DETAILS_FILE    = "./csv_analyze/ie_details_report.csv"        # one row per information element
 SUMMARY_DIR        = "./csv_analyze/"                             # directory for daily_summary_DATE.csv files
 SUMMARY_PREFIX     = "daily_summary"                 # filename prefix (date appended automatically)
 P0                 = -35    # Reference RSSI at 1 metre
@@ -356,87 +355,6 @@ CSV_FIELDS = [
 # Set from the --raw-frames CLI flag in main().
 CAPTURE_RAW_FRAMES = False
 
-# Whether the per-IE breakdown report is written at all. Off by default: it
-# emits 5-10 rows per frame against the main log's one, and every one of those
-# rows is reconstructable from Frame_Hex - it is derived data, not evidence.
-#
-# Turn it on when a parse looks wrong and the frame body needs inspecting region
-# by region. Set from the --ie-report CLI flag in main().
-IE_REPORT_ENABLED = False
-
-# Column layout for the per-IE breakdown file (one row per information element).
-IE_CSV_FIELDS = [
-    "Timestamp", "Pkt_Type", "MAC_Address", "IE_Index", "IE_ID",
-    "IE_Name", "IE_Length", "IE_Raw_Hex", "IE_Decoded",
-]
-
-# Human-readable names for the 802.11 information-element IDs we care about.
-IE_NAMES: dict[int, str] = {
-    0:   "SSID",
-    1:   "Supported Rates",
-    3:   "DS Parameter Set",
-    5:   "TIM",
-    7:   "Country",
-    11:  "QBSS Load",
-    32:  "Power Constraint",
-    33:  "Power Capability",
-    35:  "TPC Report",
-    36:  "Supported Channels",
-    42:  "ERP Info",
-    45:  "HT Capabilities",
-    48:  "RSN",
-    50:  "Extended Supported Rates",
-    54:  "Mobility Domain",
-    59:  "Supported Operating Classes",
-    61:  "HT Operation",
-    70:  "RM Enabled Capabilities",
-    74:  "Overlapping BSS Scan Params",
-    107: "Interworking",
-    108: "Advertisement Protocol",
-    127: "Extended Capabilities",
-    191: "VHT Capabilities",
-    192: "VHT Operation",
-    195: "VHT Tx Power Envelope",
-    221: "Vendor Specific",
-    255: "Element Extension",
-}
-
-# Pseudo IE IDs for the parts of a frame body that are not information
-# elements. Negative so they can never collide with a real 8-bit element ID,
-# and so `IE_ID < 0` selects every non-element row in a report.
-PSEUDO_IE_FIXED    = -1   # fixed parameters ahead of the element region
-PSEUDO_IE_UNPARSED = -2   # bytes with no known layout, preserved verbatim
-
-# Action frame categories, IEEE 802.11-2020 9.4.1.11. Used to label the fixed
-# parameters of an Action frame in the per-IE report — the category is the most
-# informative byte in the frame and would otherwise only exist as raw hex.
-ACTION_CATEGORY_NAMES: dict[int, str] = {
-    0:  "Spectrum Management",
-    1:  "QoS",
-    2:  "DLS",
-    3:  "Block Ack",
-    4:  "Public",
-    5:  "Radio Measurement",
-    6:  "Fast BSS Transition",
-    7:  "HT",
-    8:  "SA Query",
-    9:  "Protected Dual of Public Action",
-    10: "WNM",
-    11: "Unprotected WNM",
-    12: "TDLS",
-    13: "Mesh",
-    14: "Multihop",
-    15: "Self-protected",
-    16: "DMG",
-    17: "Wi-Fi Alliance",
-    18: "Fast Session Transfer",
-    19: "Robust AV Streaming",
-    20: "Unprotected DMG",
-    21: "VHT",
-    126: "Vendor Specific Protected",
-    127: "Vendor Specific",
-}
-
 # ── Fingerprint algorithm version ────────────────────────────────────────────
 # Bump ONLY when the INPUT to the SHA-1 in extract_ie_details() changes: the
 # excluded-tag set, the byte window, or the separator format. Adding CSV
@@ -475,26 +393,31 @@ log = logging.getLogger(__name__)
 
 KNOWN_OUIS: dict[str, str] = {
     "00:17:f2": "Apple, Inc.",
+    "44:fb:42": "Apple, Inc.",
     "00:00:f0": "Samsung Electronics",
     "00:e0:fc": "Huawei Technologies",
     "ac:f7:f3": "Xiaomi Communications",
-    "f8:a4:5f": "Oppo Mobile",
-    "d4:f5:13": "Vivo Mobile",
+    "f8:a4:5f": "Xiaomi Communications",
+    "d4:f5:13": "Texas Instruments",
     "00:1a:11": "Google (Pixel/Nest)",
     "00:16:ea": "Intel Corp (Laptop)",
     "00:50:f2": "Microsoft (Surface/WPS)",
     "00:10:18": "Broadcom",
-    "00:23:45": "Foxconn",
-    "4c:ed:de": "AzureWave (IoT/Laptop)",
+    "00:23:45": "Sony Corporation",
+    "4c:ed:de": "Askey Computer",
     "50:c7:bf": "TP-Link",
     "00:00:0c": "Cisco Systems",
     "00:0f:3d": "D-Link",
     "00:bb:3a": "Amazon (Echo/Kindle)",
     "24:b2:de": "Espressif (IoT/SmartHome)",
-    "84:e1:ba": "Tuya Smart (IoT)",
     "00:04:1f": "Sony Interactive (PS)",
     "00:1f:32": "Nintendo (Switch)",
-    "44:fb:42": "Tesla, Inc.",
+    "e4:40:97": "Oppo Mobile",
+    "64:ec:65": "Vivo Mobile",
+    "58:10:31": "Foxconn",
+    "50:fe:0c": "AzureWave (IoT/Laptop)",
+    "98:ed:5c": "Tesla, Inc.",
+    "1c:90:ff": "Tuya Smart (IoT)",
 }
 
 # Protocol markers that do not identify the device manufacturer. 00:50:f2 is
@@ -559,24 +482,21 @@ except Exception:
 
 def apply_output_dir(out_dir: str) -> None:
     """
-    Redirect all three report outputs into ``out_dir``, creating it if needed.
+    Redirect both report outputs into ``out_dir``, creating it if needed.
 
     Exists so a replay can be written somewhere other than the live capture's
     output. Without it, replaying a pcap would append to the accumulating packet
-    log and — worse — setup_ie_csv() opens the per-IE report with mode "w", so a
-    replay would truncate the IE breakdown belonging to a real capture.
+    log belonging to a real capture.
 
     The packet log is redirected by moving its *directory*, not its filename,
     because the filename is now assembled per rotation interval by
     build_log_path() rather than being a fixed constant. Redirecting LOG_DIR
     also keeps the pruner's glob confined to the same directory it writes into,
-    so a replay can never prune a live capture's files. The IE report keeps its
-    basename exactly as configured above so the parity tooling finds it.
+    so a replay can never prune a live capture's files.
     """
-    global LOG_DIR, IE_DETAILS_FILE, SUMMARY_DIR
+    global LOG_DIR, SUMMARY_DIR
     os.makedirs(out_dir, exist_ok=True)
     LOG_DIR         = out_dir
-    IE_DETAILS_FILE = os.path.join(out_dir, os.path.basename(IE_DETAILS_FILE))
     SUMMARY_DIR     = out_dir
 
 
@@ -743,28 +663,6 @@ def init_log_file() -> None:
     os.makedirs(LOG_DIR, exist_ok=True)
     with _writer_lock:
         _open_new_log(_log_bucket(time.time()))
-
-
-def setup_ie_csv() -> None:
-    """
-    Start a fresh per-IE breakdown CSV with its header row.
-
-    Unlike the main recon log (which accumulates across runs), this file is
-    truncated on every startup so it only holds the current session's IEs —
-    mirroring the daily summary. That keeps the two reports aligned for
-    cross-checking devices seen in the same session.
-
-    A no-op when the report is disabled, so a run without --ie-report on leaves
-    any existing report from an earlier debugging session intact.
-    """
-    if not IE_REPORT_ENABLED:
-        return
-    # Drop any cached append handle first: truncating the file underneath one
-    # would leave later rows writing past a hole at the old offset.
-    with _writer_lock:
-        _close_writer(IE_DETAILS_FILE)
-    with open(IE_DETAILS_FILE, "w", newline="") as fh:
-        csv.writer(fh).writerow(IE_CSV_FIELDS)
 
 
 def calculate_distance(rssi: int) -> float:
@@ -1220,8 +1118,7 @@ def _iter_ies(pkt):
     wire — for a Vendor Specific element that includes the three OUI bytes.
 
     Only the element-structured region is yielded. Bytes that are not elements
-    are not lost: they reach the per-IE report through dump_ie_details(), and
-    the whole frame is preserved in the Frame_Hex column.
+    are not lost: the whole frame is preserved in the Frame_Hex column.
     """
     yield from _walk_tlvs(_frame_parts(pkt).elements)[0]
 
@@ -1285,122 +1182,6 @@ def extract_ie_details(pkt) -> dict[str, str]:
         "vendor_ies":   ";".join(sorted(vendor_ies)),
         "capabilities": ";".join(sorted(capability_flags)),
     }
-
-
-def _decode_ie(ie_id: int, info: bytes) -> str:
-    """
-    Best-effort human-readable decode of a single information element's payload.
-
-    Only the common, cheaply-decodable tags are expanded; everything else
-    returns an empty string and callers fall back to the raw hex column.
-    """
-    try:
-        if ie_id == 0:  # SSID
-            return info.decode("utf-8", errors="ignore") or "(Wildcard/Hidden)"
-        if ie_id in (1, 50):  # (Extended) Supported Rates, in 0.5 Mbps units
-            rates = [f"{(b & 0x7f) / 2:g}" for b in info]
-            return "Mbps: " + ",".join(rates) if rates else ""
-        if ie_id == 3 and info:  # DS Parameter Set
-            return f"Channel {info[0]}"
-        if ie_id == 7 and len(info) >= 2:  # Country
-            return "Country " + info[:2].decode("ascii", errors="ignore")
-        if ie_id == 42 and info:  # ERP Info
-            return f"ERP 0x{info[0]:02x}"
-        if ie_id == 221 and len(info) >= 3:  # Vendor Specific
-            oui = ":".join(f"{b:02x}" for b in info[:3])
-            return f"OUI {oui} ({lookup_oui(oui)})"
-    except Exception:
-        return ""
-    return ""
-
-
-def _decode_fixed(subtype: int, fixed: bytes) -> str:
-    """
-    Best-effort label for a frame's fixed parameters, for the per-IE report.
-
-    Only the fields that are cheap and unambiguous are named; the full bytes are
-    in the IE_Raw_Hex column of the same row either way, so anything not decoded
-    here is still recoverable.
-    """
-    try:
-        if subtype in (13, 14) and len(fixed) >= 2:      # Action, Action No Ack
-            category, action = fixed[0], fixed[1]
-            name = ACTION_CATEGORY_NAMES.get(category, f"Category {category}")
-            return f"{name}, action {action}"
-        if subtype in (0, 2) and len(fixed) >= 4:        # (Re)Assoc Request
-            return f"cap 0x{int.from_bytes(fixed[0:2], 'little'):04x}, " \
-                   f"listen interval {int.from_bytes(fixed[2:4], 'little')}"
-        if subtype in (1, 3) and len(fixed) >= 6:        # (Re)Assoc Response
-            return f"cap 0x{int.from_bytes(fixed[0:2], 'little'):04x}, " \
-                   f"status {int.from_bytes(fixed[2:4], 'little')}, " \
-                   f"AID {int.from_bytes(fixed[4:6], 'little')}"
-        if subtype in (5, 8) and len(fixed) >= 12:       # Probe Response, Beacon
-            return f"beacon interval {int.from_bytes(fixed[8:10], 'little')} TU, " \
-                   f"cap 0x{int.from_bytes(fixed[10:12], 'little'):04x}"
-        if subtype == 11 and len(fixed) >= 6:            # Authentication
-            return f"algo {int.from_bytes(fixed[0:2], 'little')}, " \
-                   f"seq {int.from_bytes(fixed[2:4], 'little')}, " \
-                   f"status {int.from_bytes(fixed[4:6], 'little')}"
-        if subtype in (10, 12) and len(fixed) >= 2:      # Disassoc, Deauth
-            return f"reason {int.from_bytes(fixed[0:2], 'little')}"
-    except Exception:
-        return ""
-    return ""
-
-
-def dump_ie_details(pkt, timestamp: str, pkt_type: str, mac_addr: str) -> None:
-    """
-    Append one row per region of the frame body to IE_DETAILS_FILE.
-
-    Where the main recon log records a single row per packet, this breaks each
-    frame down region by region so its raw content can be inspected offline.
-
-    Every byte of the body appears in exactly one row. Information elements get
-    a row each, as before. The fixed parameters ahead of them, and any region
-    that is not element-structured — a reserved subtype's body, an Action
-    category with no offset entry, a snaplen-truncated tail — get their own rows
-    under the pseudo-IDs below, rather than being dropped because nothing here
-    knows how to decode them yet. Concatenating IE_Raw_Hex across a frame's rows
-    reproduces the body exactly.
-
-    A no-op when the report is disabled.
-    """
-    if not IE_REPORT_ENABLED:
-        return
-    parts = _frame_parts(pkt)
-    rows  = []
-    index = 0
-
-    if parts.fixed:
-        rows.append([
-            timestamp, pkt_type, mac_addr, index, PSEUDO_IE_FIXED,
-            "Fixed Parameters", len(parts.fixed), parts.fixed.hex(),
-            _decode_fixed(parts.subtype, parts.fixed),
-        ])
-        index += 1
-
-    for ie_id, info in _walk_tlvs(parts.elements)[0]:
-        rows.append([
-            timestamp, pkt_type, mac_addr, index, ie_id,
-            IE_NAMES.get(ie_id, f"Unknown({ie_id})"),
-            len(info), info.hex(), _decode_ie(ie_id, info),
-        ])
-        index += 1
-
-    if parts.unparsed:
-        rows.append([
-            timestamp, pkt_type, mac_addr, index, PSEUDO_IE_UNPARSED,
-            "Unparsed Bytes", len(parts.unparsed), parts.unparsed.hex(),
-            "not element-structured; kept verbatim",
-        ])
-        index += 1
-
-    if not rows:
-        return
-    with _writer_lock:
-        handle = _writer_for(IE_DETAILS_FILE)
-        csv.writer(handle).writerows(rows)
-        handle.flush()
 
 
 def extract_ssid(pkt, fallback: str) -> str:
@@ -2118,8 +1899,6 @@ def _process_frame(pkt) -> None:
     if ship_logstash.shipping_enabled():
         ship_logstash.ship_row(dict(zip(CSV_FIELDS, row)), f"{pkt_type} {mac_addr}")
 
-    dump_ie_details(pkt, timestamp, pkt_type, mac_addr)
-
 
 # ---------------------------------------------------------------------------
 # Background threads
@@ -2330,12 +2109,9 @@ def run_replay(pcap_path: str, parser: argparse.ArgumentParser) -> None:
 
     REPLAY_MODE = True
     init_log_file()
-    setup_ie_csv()
 
     log.info("Replaying capture file          : %s", pcap_path)
     log.info("Logging packets to              : %s", LOG_FILE)
-    log.info("Logging IE breakdown to         : %s",
-             IE_DETAILS_FILE if IE_REPORT_ENABLED else "off")
     log.info("Terminal frame filter           : %s", _describe_hidden_types())
     log.info("Raw frame bytes (Frame_Hex)     : %s",
              "on" if CAPTURE_RAW_FRAMES else "off")
@@ -2438,15 +2214,6 @@ def main() -> None:
              "log without re-capturing.",
     )
     parser.add_argument(
-        "--ie-report",
-        choices=["on", "off"],
-        default="off",
-        help="Whether to write the per-information-element breakdown report "
-             "(default: off). It writes 5-10 rows per frame and every row is "
-             "reconstructable from Frame_Hex, so it is off unless a parse needs "
-             "inspecting. Does not affect the main packet log.",
-    )
-    parser.add_argument(
         "--prune",
         choices=["on", "off"],
         default="off",
@@ -2499,7 +2266,7 @@ def main() -> None:
     if args.hop and args.mode == "camp":
         parser.error("--hop contradicts --mode camp; pass only one of them.")
 
-    global TERMINAL_HIDE_TYPES, CAPTURE_RAW_FRAMES, IE_REPORT_ENABLED
+    global TERMINAL_HIDE_TYPES, CAPTURE_RAW_FRAMES
     global LOG_PRUNE_ENABLED
     try:
         TERMINAL_HIDE_TYPES = resolve_hidden_types(args.hide)
@@ -2513,7 +2280,6 @@ def main() -> None:
         log.warning("Terminal output suppressed for all %d frame types; "
                     "CSV logging is unaffected.", len(TERMINAL_HIDE_TYPES))
     CAPTURE_RAW_FRAMES    = args.raw_frames == "on"
-    IE_REPORT_ENABLED     = args.ie_report == "on"
     LOG_PRUNE_ENABLED     = args.prune == "on"
 
     if args.out_dir:
@@ -2589,7 +2355,6 @@ def main() -> None:
         hop_channels = build_hop_channels(band)
 
     init_log_file()
-    setup_ie_csv()
 
     log.info("Starting WiFi Recon on interface: %s", iface)
     log.info("Logging packets to            : %s", LOG_FILE)
@@ -2599,8 +2364,6 @@ def main() -> None:
              f"(>= {(LOG_KEEP_FILES - 1) * LOG_ROTATE_SECONDS // 60} min)"
              if LOG_PRUNE_ENABLED and LOG_KEEP_FILES > 0
              else "unlimited (pruning off)")
-    log.info("Logging IE breakdown to       : %s",
-             IE_DETAILS_FILE if IE_REPORT_ENABLED else "off")
     log.info("Max reconnect attempts        : %d", MAX_RETRIES)
     log.info("Terminal frame filter         : %s", _describe_hidden_types())
     log.info("Raw frame bytes (Frame_Hex)   : %s",

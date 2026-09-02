@@ -475,7 +475,7 @@ class CorrelationIdentityTests(unittest.TestCase):
         self.assertEqual(ns.get_correlation_identity(pkt), "Apple Device (Unknown)")
 
     def test_iot_vendor_from_mac_oui_alone(self):
-        pkt = WirePacket(addr2="84:E1:BA:11:22:33")
+        pkt = WirePacket(addr2="1C:90:FF:11:22:33")
         self.assertEqual(
             ns.get_correlation_identity(pkt), "Smart Home/IoT (Tuya Smart (IoT))"
         )
@@ -487,76 +487,6 @@ class CorrelationIdentityTests(unittest.TestCase):
     def test_falls_back_to_addr3_when_addr2_missing(self):
         pkt = WirePacket(addr2=None, addr3="50:C7:BF:11:22:33")
         self.assertEqual(ns.get_correlation_identity(pkt), "TP-Link (Unknown)")
-
-
-# ---------------------------------------------------------------------------
-# Information-element decoding
-# ---------------------------------------------------------------------------
-
-class DecodeIeTests(unittest.TestCase):
-    def test_ssid_tag(self):
-        self.assertEqual(ns._decode_ie(0, b"MySSID"), "MySSID")
-
-    def test_hidden_ssid_tag(self):
-        self.assertEqual(ns._decode_ie(0, b""), "(Wildcard/Hidden)")
-
-    def test_supported_rates_tag(self):
-        self.assertEqual(ns._decode_ie(1, bytes([0x82, 0x84])), "Mbps: 1,2")
-
-    def test_ds_parameter_set_tag(self):
-        self.assertEqual(ns._decode_ie(3, bytes([6])), "Channel 6")
-
-    def test_country_tag(self):
-        self.assertEqual(ns._decode_ie(7, b"US "), "Country US")
-
-    def test_erp_info_tag(self):
-        self.assertEqual(ns._decode_ie(42, bytes([0x04])), "ERP 0x04")
-
-    def test_vendor_specific_tag_includes_friendly_name(self):
-        self.assertEqual(
-            ns._decode_ie(221, b"\x00\x50\xf2\x04"),
-            "OUI 00:50:f2 (Microsoft (Surface/WPS))",
-        )
-
-    def test_unrecognized_tag_decodes_to_empty_string(self):
-        self.assertEqual(ns._decode_ie(99, b"\x01\x02"), "")
-
-
-class DumpIeDetailsTests(unittest.TestCase):
-    def setUp(self):
-        import tempfile
-        self._tmpdir = tempfile.TemporaryDirectory()
-        self.tmp_file = Path(self._tmpdir.name) / "ie_details.csv"
-
-    def tearDown(self):
-        self._tmpdir.cleanup()
-
-    def test_rows_match_ie_sequence_and_decode(self):
-        pkt = WirePacket(elements=tlv(0, b"AB") + tlv(3, b"\x06"))
-        # The report is gated off by default, so enable it for the duration:
-        # these tests cover the report's machinery, which the gate leaves intact.
-        with patch.object(ns, "IE_DETAILS_FILE", str(self.tmp_file)), \
-             patch.object(ns, "IE_REPORT_ENABLED", True):
-            ns.dump_ie_details(pkt, "2026-01-01 00:00:00", "PROBE", "AA:BB:CC:DD:EE:FF")
-        with open(self.tmp_file, newline="") as fh:
-            rows = list(csv.reader(fh))
-
-        self.assertEqual(len(rows), 2)
-        ts, pkt_type, mac, index, ie_id, ie_name, ie_len, ie_hex, ie_decoded = rows[0]
-        self.assertEqual((pkt_type, mac, index, ie_id, ie_name), ("PROBE", "AA:BB:CC:DD:EE:FF", "0", "0", "SSID"))
-        self.assertEqual(ie_decoded, "AB")
-        self.assertEqual(rows[1][4], "3")
-        self.assertEqual(rows[1][5], "DS Parameter Set")
-        self.assertEqual(rows[1][8], "Channel 6")
-
-    def test_no_information_elements_writes_nothing(self):
-        pkt = WirePacket()
-        # Enabled deliberately: with the report off this would pass whatever the
-        # frame contained, which is not what the test claims to check.
-        with patch.object(ns, "IE_DETAILS_FILE", str(self.tmp_file)), \
-             patch.object(ns, "IE_REPORT_ENABLED", True):
-            ns.dump_ie_details(pkt, "2026-01-01 00:00:00", "BEACON", "AA:BB:CC:DD:EE:FF")
-        self.assertFalse(self.tmp_file.exists())
 
 
 # ---------------------------------------------------------------------------
@@ -603,25 +533,6 @@ class CsvSetupTests(unittest.TestCase):
             ns.init_log_file()
             self.assertEqual(ns.LOG_FILE, existing)
         self.assertEqual(Path(existing).read_text(), "not,a,header\n1,2,3\n")
-
-    def test_setup_ie_csv_creates_header_when_missing(self):
-        with patch.object(ns, "IE_DETAILS_FILE", str(self.tmp_file)), \
-             patch.object(ns, "IE_REPORT_ENABLED", True):
-            ns.setup_ie_csv()
-            with open(self.tmp_file, newline="") as fh:
-                rows = list(csv.reader(fh))
-        self.assertEqual(rows, [ns.IE_CSV_FIELDS])
-
-    def test_setup_ie_csv_truncates_previous_session(self):
-        # Unlike the main log, the IE report holds only the current session so it
-        # can be cross-checked against the daily summary — startup wipes stale rows.
-        self.tmp_file.write_text("old,session,data\n1,2,3\n")
-        with patch.object(ns, "IE_DETAILS_FILE", str(self.tmp_file)), \
-             patch.object(ns, "IE_REPORT_ENABLED", True):
-            ns.setup_ie_csv()
-            with open(self.tmp_file, newline="") as fh:
-                rows = list(csv.reader(fh))
-        self.assertEqual(rows, [ns.IE_CSV_FIELDS])
 
     def test_append_csv_row_appends_after_header(self):
         # LOG_DIR is patched rather than LOG_FILE: the live path now rolls the

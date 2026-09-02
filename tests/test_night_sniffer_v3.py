@@ -203,9 +203,7 @@ class NightSnifferV3PacketHandlerTests(unittest.TestCase):
             night_sniffer_v3, "track_session", return_value="New-User-1"
         ) as track_session, patch.object(
             night_sniffer_v3, "_append_csv_row"
-        ) as append_row, patch.object(
-            night_sniffer_v3, "dump_ie_details"
-        ), patch("builtins.print"):
+        ) as append_row, patch("builtins.print"):
             night_sniffer_v3._process_frame(FakePacket())
 
         # seq is passed to track_session as the 10th positional arg (index 9);
@@ -249,9 +247,7 @@ class NightSnifferV3PacketHandlerTests(unittest.TestCase):
             night_sniffer_v3, "track_session"
         ) as track_session, patch.object(
             night_sniffer_v3, "_append_csv_row"
-        ) as append_row, patch.object(
-            night_sniffer_v3, "dump_ie_details"
-        ), patch("builtins.print"):
+        ) as append_row, patch("builtins.print"):
             night_sniffer_v3._process_frame(FakePacket())
 
         append_row.assert_called_once()
@@ -493,42 +489,6 @@ class NightSnifferV3LosslessTests(unittest.TestCase):
         self.assertEqual(parts.elements, b"\x00\x03abc")
         self.assertEqual(parts.unparsed, b"\x2d\x1a\xff")
 
-    def test_ie_report_rows_reconstruct_the_body(self):
-        import csv as csv_mod
-        import os
-        import tempfile
-
-        body = bytes(12) + b"\x00\x03abc" + b"\x2d\x1a\xff"
-        with tempfile.TemporaryDirectory() as tmp:
-            path = os.path.join(tmp, "ie.csv")
-            # The report is gated off by default, so enable it for the duration:
-            # this test is about the machinery being correct, not about whether
-            # the flag is on.
-            with patch.object(night_sniffer_v3, "IE_DETAILS_FILE", path), \
-                 patch.object(night_sniffer_v3, "IE_REPORT_ENABLED", True):
-                night_sniffer_v3.dump_ie_details(
-                    _pkt(_wire(8, body)), "ts", "BEACON", "AA:BB"
-                )
-                night_sniffer_v3.close_output_files()
-                with open(path, newline="") as fh:
-                    rows = list(csv_mod.reader(fh))
-
-        # Rebuild the body from the report. Element rows store the payload in
-        # IE_Raw_Hex with the tag and length in their own columns, so an element
-        # is IE_ID + IE_Length + IE_Raw_Hex; the pseudo-ID rows are raw regions
-        # and contribute their hex alone. Every byte must be accounted for.
-        rebuilt = b""
-        for row in rows:
-            ie_id, ie_len, ie_hex = int(row[4]), int(row[6]), row[7]
-            if ie_id >= 0:
-                rebuilt += bytes([ie_id, ie_len])
-            rebuilt += bytes.fromhex(ie_hex)
-        self.assertEqual(rebuilt, body)
-
-        names = [r[5] for r in rows]
-        self.assertIn("Fixed Parameters", names)
-        self.assertIn("Unparsed Bytes", names)
-
     def test_frame_hex_column_holds_the_whole_frame(self):
         # Columns are appended after Frame_Hex, never inserted before it, so
         # its index is what must hold — not its being the final entry.
@@ -589,12 +549,11 @@ class NightSnifferV3WriterTests(unittest.TestCase):
     def setUp(self):
         import tempfile
         self._tmpdir = tempfile.TemporaryDirectory()
-        self._paths = (night_sniffer_v3.LOG_FILE, night_sniffer_v3.IE_DETAILS_FILE)
+        self._paths = night_sniffer_v3.LOG_FILE
 
     def tearDown(self):
         night_sniffer_v3.close_output_files()
-        (night_sniffer_v3.LOG_FILE,
-         night_sniffer_v3.IE_DETAILS_FILE) = self._paths
+        night_sniffer_v3.LOG_FILE = self._paths
         self._tmpdir.cleanup()
 
     def test_handle_is_reused_then_closed_on_shutdown(self):
@@ -621,34 +580,20 @@ class NightSnifferV3WriterTests(unittest.TestCase):
             with open(path, newline="") as fh:
                 self.assertEqual(list(csv_mod.reader(fh)), [["a", "b"]])
 
-    def test_truncating_the_ie_report_drops_the_cached_handle(self):
-        import os
-
-        path = os.path.join(self._tmpdir.name, "ie.csv")
-        with patch.object(night_sniffer_v3, "IE_DETAILS_FILE", path), \
-             patch.object(night_sniffer_v3, "IE_REPORT_ENABLED", True):
-            night_sniffer_v3._writer_for(path)
-            night_sniffer_v3.setup_ie_csv()
-            # A stale append handle would write past a hole at the old offset.
-            self.assertNotIn(path, night_sniffer_v3._open_writers)
-
-
 class NightSnifferV3OutputDirTests(unittest.TestCase):
-    """--out-dir must move all three reports, so a replay cannot clobber a capture."""
+    """--out-dir must move both reports, so a replay cannot clobber a capture."""
 
     def setUp(self):
         self._paths = (
             night_sniffer_v3.LOG_DIR,
-            night_sniffer_v3.IE_DETAILS_FILE,
             night_sniffer_v3.SUMMARY_DIR,
         )
 
     def tearDown(self):
         (night_sniffer_v3.LOG_DIR,
-         night_sniffer_v3.IE_DETAILS_FILE,
          night_sniffer_v3.SUMMARY_DIR) = self._paths
 
-    def test_redirects_all_three_outputs_and_keeps_basenames(self):
+    def test_redirects_both_outputs(self):
         # The packet log is redirected by directory, not filename, because its
         # filename is assembled per rotation interval. Moving LOG_DIR is also
         # what confines the pruner's glob to the replay's own directory, so a
@@ -656,7 +601,6 @@ class NightSnifferV3OutputDirTests(unittest.TestCase):
         import os
         import tempfile
 
-        original_ie = os.path.basename(night_sniffer_v3.IE_DETAILS_FILE)
         with tempfile.TemporaryDirectory() as tmp:
             target = os.path.join(tmp, "made", "on", "demand")
             night_sniffer_v3.apply_output_dir(target)
@@ -664,8 +608,6 @@ class NightSnifferV3OutputDirTests(unittest.TestCase):
             self.assertEqual(night_sniffer_v3.LOG_DIR, target)
             self.assertEqual(
                 os.path.dirname(night_sniffer_v3.build_log_path(0.0)), target)
-            self.assertEqual(night_sniffer_v3.IE_DETAILS_FILE,
-                             os.path.join(target, original_ie))
             self.assertEqual(night_sniffer_v3.SUMMARY_DIR, target)
 
 
