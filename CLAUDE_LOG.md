@@ -2056,3 +2056,39 @@ Verification: `ast` ok; 170 tests OK (`PYTHONPATH=src ... discover -s tests`);
   vendors. That is more coverage, not less, but it does mean e.g. Xiaomi has two
   entries and Apple two — harmless for a lookup dict, just worth knowing when
   reading it.
+
+---
+
+## 2026-09-02 13:33 Explainer — Session_Note, terminal log, and vendor inference
+
+Pla2 asked how `Session_Note` works, how it relates to the terminal live log,
+and where each report's vendor name is inferred from (real MAC OUI vs IE
+fingerprint). Read-only; no code changed.
+
+Written to `explanation/20260902-1333-session-note-and-vendor-inference.md`
+(286 lines). Covers:
+
+- `Session_Note` = `f"{session_note} | {identity}"` (:1859), its four possible
+  labels, and the two distinct `Existing-User-N` sites (:1547 direct MAC hit,
+  :1574 randomized-merge score).
+- The terminal line's trailing field is the same `identity` variable as `Note`,
+  so `[A]` on screen always means `AP-Logged-Only` in the CSV and the session
+  label is CSV-only.
+- The three vendor paths: `Vendor` on a real MAC uses the full
+  `mac_vendor_lookup` DB; on a randomized MAC it uses tag-221 OUIs via
+  `KNOWN_OUIS` then the DB; `Note`/identity uses **`KNOWN_OUIS` only** with no DB
+  fallback, which is why the two columns can legitimately disagree.
+- `IE_Fingerprint` feeds session merging only and is never a vendor source.
+- Summary `Device_Type` is the identity frozen at session creation.
+
+### Suggestions / Issues noticed
+
+- `Note` duplicates the right half of `Session_Note` in every row.
+- `get_correlation_identity()` has no `mac_vendor_lookup` fallback, unlike
+  `vendor_from_ie_ouis()`.
+- `session.fingerprint` is never refreshed after creation, so summary
+  `Device_Type` can stay `Unknown Device` against strong later evidence.
+- IoT classification (:1263) matches on the literal label text `"Tuya Smart"` /
+  `"Espressif"` in `KNOWN_OUIS`, so a dict value edit can reclassify devices.
+- The randomized-merge `reasons` list is DEBUG-logged and then discarded —
+  neither report records why two MACs were merged.
