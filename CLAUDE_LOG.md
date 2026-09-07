@@ -2092,3 +2092,61 @@ Written to `explanation/20260902-1333-session-note-and-vendor-inference.md`
   `"Espressif"` in `KNOWN_OUIS`, so a dict value edit can reclassify devices.
 - The randomized-merge `reasons` list is DEBUG-logged and then discarded —
   neither report records why two MACs were merged.
+
+## 2026-09-04 09:24 Code review — architecture, quality, dead code (read-only, no code changed)
+
+- Reviewed `src/night_sniffer_v3.py` (2498 lines) and `src/ship_logstash.py`
+  (174 lines) on three aspects: single-file vs module architecture, code
+  quality, unnecessary code. Neither file was edited, per instruction.
+- Method: full read, plus a grep census of every `def`, module constant and
+  `Session` field across `src/`, `tests/`, `scripts/`. No linter is installed
+  in `.venv`. 170 tests pass on the reviewed tree.
+- Written to
+  `explanation/20260904-0924-code-review-architecture-quality-dead-code.md`.
+- Architecture verdict: stay single-file for now. A 6-module split is
+  mechanical (dependencies already point one way) but the tests patch 14
+  module globals by name, and `global X` rebinding would break across
+  modules. Precondition for any split: move the two import-time side effects
+  (`logging.basicConfig()` :374, `MacLookup().update_metadata()` :475 —
+  a network fetch on every import, tests included) into `main()`.
+
+### Suggestions / Issues noticed
+
+- `--prune on` with `--pcap` and no `--out-dir` can delete live capture
+  files: `run_replay()` → `init_log_file()` → `_prune_old_logs()` runs
+  once, and the pruner does not check `REPLAY_MODE`, contradicting the
+  `--prune` help text.
+- `_last_seen` (:1830) is never expired; only unbounded structure in the
+  process.
+- Session ids are reused after expiry (`max(keys)+1`, :1573), so `User_N`
+  in successive summary snapshots can be two different devices.
+- `generate_session_report()` iterates session sets outside
+  `_session_lock`; a concurrent update can raise inside the auto-report
+  thread, which has no try/except.
+- `_frame_parts()` runs ~4× and `_walk_tlvs()` ~7× per packet because each
+  `extract_*` / identity call re-parses from scratch.
+- `--raw-frames` defaults to on in code (:356, :2210) but CLAUDE.md :23 and
+  the `CSV_FIELDS` comment :342 say default off.
+- Terminal banner (:2121, :2374) column order does not match the printed
+  line (:1872).
+- Dead: `seq_delta()` (:678, only a test calls it). Write-only:
+  `Session.last_seq`, `last_mac`, `current_aps`, `listen_intervals`,
+  `security_tiers` and `_store_frame_body_evidence()` — Phase-2 scaffolding
+  nothing reads.
+- Duplicated between `run_replay()` and `main()`: startup log lines
+  (already drifted in padding), the column banner, and the 4-step shutdown.
+- Stale text: `--out-dir` help says "three reports"; :2422 refers to
+  `wifi_sniffer.py`; `get_vendor()`'s `mac_type` guard duplicates its
+  caller's; `ship_logstash.py` tunables still say "Tightened for the test".
+
+## 2026-09-04 09:41 Aligned --raw-frames documentation with its default (on)
+
+- `CAPTURE_RAW_FRAMES = True` and `--raw-frames default="on"` were already
+  the code's behaviour; only the surrounding text still said "default off".
+  No behaviour change. `--prune` untouched and still defaults to off.
+- `src/night_sniffer_v3.py`: `CSV_FIELDS` Frame_Hex comment, the
+  `CAPTURE_RAW_FRAMES` comment, and the `--raw-frames` help text now all say
+  on by default, with off described as the opt-out that halves row size.
+- `CLAUDE.md` ethics section: "`--raw-frames on`, default off" → "`--raw-frames`,
+  default on".
+- 170 tests pass.

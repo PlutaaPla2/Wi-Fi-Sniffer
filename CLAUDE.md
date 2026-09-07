@@ -20,7 +20,7 @@ sign-off before you write code**.
   metadata is in scope.
 - **Do not widen collection.** No payload capture, no capture of data frames.
   Collection scope stays 802.11 management frames. Raw management-frame bytes
-  (`Frame_Hex`, `--raw-frames on`, default off) are within scope — they are the
+  (`Frame_Hex`, `--raw-frames`, default on) are within scope — they are the
   same frames already decoded into columns, not new collection surface.
 - **Captured data is PII, and it moves only inside the approved perimeter.**
   Signed off 2026-08-25 by the PM and the senior colleague, superseding the

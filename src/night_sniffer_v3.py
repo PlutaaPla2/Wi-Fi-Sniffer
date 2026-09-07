@@ -339,7 +339,7 @@ CSV_FIELDS = [
     # re-capturing. The 25 columns above it never move; it is followed only by
     # columns appended after it, which is why Timestamp_ISO sits below and not
     # next to Timestamp.
-    # Set --raw-frames on to populate it; off (the default) leaves it empty.
+    # Populated by default; --raw-frames off leaves it empty.
     "Frame_Hex",
     # Capture time at microsecond resolution with an explicit UTC offset, so
     # frames arriving inside the same second can be ordered and nothing
@@ -352,8 +352,8 @@ CSV_FIELDS = [
 # Whether Frame_Hex is populated. Management frames only, which is the same
 # scope scripts/run_dumpcap.sh already writes to pcap_files/ — this adds no new
 # collection surface, it keeps the bytes alongside the decoded columns.
-# Set from the --raw-frames CLI flag in main().
-CAPTURE_RAW_FRAMES = False
+# On by default; set from the --raw-frames CLI flag in main().
+CAPTURE_RAW_FRAMES = True
 
 # ── Fingerprint algorithm version ────────────────────────────────────────────
 # Bump ONLY when the INPUT to the SHA-1 in extract_ie_details() changes: the
@@ -2206,12 +2206,11 @@ def main() -> None:
     parser.add_argument(
         "--raw-frames",
         choices=["on", "off"],
-        default="off",
+        default="on",
         help="Whether to record the complete frame bytes in the Frame_Hex "
-             "column (default: off). Off keeps the CSV small, at the cost of "
-             "losing anything the other columns do not capture. Turn it on to "
-             "keep everything this tool cannot decode yet recoverable from the "
-             "log without re-capturing.",
+             "column (default: on). On keeps everything this tool cannot "
+             "decode yet recoverable from the log without re-capturing; off "
+             "roughly halves the row size.",
     )
     parser.add_argument(
         "--prune",
