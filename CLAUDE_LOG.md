@@ -2150,3 +2150,14 @@ Written to `explanation/20260902-1333-session-note-and-vendor-inference.md`
 - `CLAUDE.md` ethics section: "`--raw-frames on`, default off" → "`--raw-frames`,
   default on".
 - 170 tests pass.
+
+## 2026-09-09 09:25 Wrote code walkthrough for night_sniffer_v3.py and ship_logstash.py
+
+- `explanation/20260909-0925-how-night-sniffer-v3-and-ship-logstash-work.md`:
+  understanding-oriented guide to both files at commit `ddf8154`. Covers the
+  file map, settings vs protocol tables vs runtime-mutated globals, the
+  `Session` model, rotation/pruning, the two clocks, raw-TLV frame parsing,
+  the merge scorer table, `_process_frame()` step by step, `main()`'s
+  recovery loop, the shipper's state machine (including why
+  `propagate = False` is load-bearing), replay, and a "easy to misread" list.
+- No code changed. No tests run (documentation only).
