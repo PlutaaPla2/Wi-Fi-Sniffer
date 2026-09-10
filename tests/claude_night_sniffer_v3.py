@@ -612,11 +612,12 @@ class LogPruningTests(unittest.TestCase):
             paths.append(str(path))
         return paths
 
-    def _prune(self, active, *, enabled=True, keep=2):
+    def _prune(self, active, *, enabled=True, keep=2, replay=False):
         with patch.object(ns, "LOG_DIR", self.dir), \
              patch.object(ns, "LOG_PREFIX", "wifi_full_recon_report"), \
              patch.object(ns, "LOG_KEEP_FILES", keep), \
              patch.object(ns, "LOG_PRUNE_ENABLED", enabled), \
+             patch.object(ns, "REPLAY_MODE", replay), \
              patch.object(ns, "LOG_FILE", active):
             ns._prune_old_logs()
         return sorted(str(p) for p in Path(self.dir).glob("*.csv"))
@@ -633,6 +634,15 @@ class LogPruningTests(unittest.TestCase):
     def test_disabled_switch_deletes_nothing(self):
         paths = self._seed(6)
         self.assertEqual(self._prune(paths[-1], enabled=False), paths)
+
+    def test_replay_mode_deletes_nothing(self):
+        # --prune is documented as ignored during --pcap replay. Replay writes a
+        # single file and never rotates, so every file the pruner could reach
+        # here belongs to another run: without --out-dir that is the live
+        # capture directory, and the replay's wall-clock-named file sorts last,
+        # which would make every older live capture file a candidate.
+        paths = self._seed(6)
+        self.assertEqual(self._prune(paths[-1], replay=True), paths)
 
     def test_keep_zero_deletes_nothing(self):
         # Guarded separately from the switch so a misconfigured 0 cannot be read

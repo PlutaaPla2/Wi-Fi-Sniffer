@@ -617,8 +617,16 @@ def _prune_old_logs() -> None:
     A failure to delete is logged and skipped, never raised: a stale file is a
     disk-space problem, while an exception escaping here would reach the packet
     callback and cost frames.
+
+    Never prunes during a --pcap replay, which is what the --prune help text
+    already promises. Replay writes a single file and never rotates, so the only
+    files it could reach here belong to some other run: without --out-dir it
+    writes into the live capture directory, and its wall-clock-named file sorts
+    last, which would make every older live capture file a deletion candidate.
+    Pruning during a replay can never be useful, so this is a guard rather than
+    a policy choice.
     """
-    if not LOG_PRUNE_ENABLED or LOG_KEEP_FILES <= 0:
+    if REPLAY_MODE or not LOG_PRUNE_ENABLED or LOG_KEEP_FILES <= 0:
         return
 
     pattern = os.path.join(LOG_DIR, f"*-{LOG_PREFIX}.csv")
@@ -2229,7 +2237,7 @@ def main() -> None:
     parser.add_argument(
         "--out-dir",
         default=None,
-        help="Write all three reports into this directory instead of the "
+        help="Write both reports into this directory instead of the "
              "configured defaults. Created if missing; filenames are unchanged.",
     )
     parser.add_argument(
@@ -2418,10 +2426,9 @@ def main() -> None:
 
     # ── Capture loop with automatic interface recovery ────────────────────────
     # sniff() exits silently (returns normally without raising) when the adapter
-    # drops out of monitor mode — the same "Network is down" scenario we handle
-    # in wifi_sniffer.py. The outer while loop detects this and calls
-    # reset_monitor_mode() before trying again, up to MAX_RETRIES consecutive
-    # times.
+    # drops out of monitor mode — the "Network is down" scenario. The outer
+    # while loop detects this and calls reset_monitor_mode() before trying
+    # again, up to MAX_RETRIES consecutive times.
     # A clean Ctrl+C raises KeyboardInterrupt which breaks out of the loop
     # immediately into the final report save below.
     retry_count = 0

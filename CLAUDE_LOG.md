@@ -2161,3 +2161,36 @@ Written to `explanation/20260902-1333-session-note-and-vendor-inference.md`
   recovery loop, the shipper's state machine (including why
   `propagate = False` is load-bearing), replay, and a "easy to misread" list.
 - No code changed. No tests run (documentation only).
+
+## 2026-09-10 14:48 Fixed §2.1 — --prune could delete live capture files during --pcap replay
+
+- `src/night_sniffer_v3.py` `_prune_old_logs()`: added `REPLAY_MODE` to the
+  early-return guard, plus a docstring paragraph explaining why. Rotation was
+  already skipped in replay via `_append_csv_row()`, but `run_replay()` reaches
+  the pruner through `init_log_file()` -> `_open_new_log()`, which called it
+  unconditionally. A replay with `--prune on` and no `--out-dir` writes into
+  `./csv_analyze` and its wall-clock-named file sorts last, making every older
+  live capture file a deletion candidate. The `--prune` help text already
+  claimed pruning was ignored in replay, so this makes the code match the
+  documented behaviour; no help text changed.
+- `tests/claude_night_sniffer_v3.py`: `_prune()` helper gained a `replay=False`
+  keyword (default keeps the eight existing prune tests unchanged) and a new
+  `test_replay_mode_deletes_nothing`. Confirmed the test fails with the guard
+  reverted and passes with it in place.
+- Live capture is unaffected: `REPLAY_MODE` is assigned only in `run_replay()`,
+  so the new term is always False on the live path and the remaining condition
+  is the original one. The pruner's only production caller is `_open_new_log()`,
+  which runs once per rotation, not per frame.
+- 171 tests pass (was 170).
+
+## 2026-09-10 15:05 Corrected two stale help/comment texts (§4.2, partial)
+
+- `src/night_sniffer_v3.py` `--out-dir` help: "Write all three reports" ->
+  "Write both reports". There have been two reports since the IE report was
+  removed; `apply_output_dir()`'s docstring already said "both", so the file
+  contradicted itself.
+- `src/night_sniffer_v3.py` capture-loop comment: dropped the "the same
+  scenario we handle in wifi_sniffer.py" reference. That file is listed in
+  CLAUDE.md as old and unused, so it is not a useful pointer for a reader.
+  The description of the failure mode itself is unchanged.
+- Text only, no behaviour change. 171 tests pass.
